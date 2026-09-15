@@ -1900,6 +1900,38 @@ async def test_api_get_follows_same_host_redirect(monkeypatch):
         assert httpx.URL(url).host == "github.test"
 
 
+async def test_api_get_reenforces_allowlist_on_redirect_to_disallowed_owner(monkeypatch):
+    seen = []
+
+    def handler(request: httpx.Request) -> Response:
+        seen.append(request.url.path)
+        if request.url.path == "/api/repos/acme/old":
+            # A same-origin 301 onto an owner OUTSIDE the allowlist (e.g. a repo
+            # transferred to a new owner) — must be re-checked, not followed.
+            return Response(301, headers={"Location": "https://github.test/api/repos/other/new"})
+        return _json_response({"ok": True})  # pragma: no cover - must not be reached
+
+    _install_mock_client(monkeypatch, handler)
+    with pytest.raises(GitHubApiRequestError, match="allowlist"):
+        await _scoped_api_client(["acme"]).api_get(path="/repos/acme/old")
+    assert seen == ["/api/repos/acme/old"]  # the disallowed hop was never issued
+
+
+async def test_api_get_follows_redirect_to_allowed_owner(monkeypatch):
+    seen = []
+
+    def handler(request: httpx.Request) -> Response:
+        seen.append(request.url.path)
+        if request.url.path == "/api/repos/acme/old":
+            return Response(301, headers={"Location": "https://github.test/api/repos/acme2/new"})
+        return _json_response({"ok": True})
+
+    _install_mock_client(monkeypatch, handler)
+    result = await _scoped_api_client(["acme", "acme2"]).api_get(path="/repos/acme/old")
+    assert result.body == {"ok": True}
+    assert seen == ["/api/repos/acme/old", "/api/repos/acme2/new"]  # both owners allowed
+
+
 async def test_api_get_redirect_hop_cap(monkeypatch):
     seen = []
 

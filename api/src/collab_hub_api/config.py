@@ -569,10 +569,11 @@ class GitHubConnectorConfig(BaseModel):
     api_base_url: str = "https://api.github.com"
     static_access_token: str = ""
     request_timeout_seconds: float = 10.0
-    # Restrict search AND the generic api_get read to these GitHub org logins.
-    # Empty = the token's full visibility (personal repos + every approved org).
-    # Set this in real deploys so agent searches do not interleave personal and
-    # work results, and so the generic read cannot reach outside the allowlist.
+    # Restrict the generic api_get read to these GitHub org logins. Empty = the
+    # token's full visibility (personal repos + every approved org). Set this in
+    # real deploys so the generic read cannot reach outside the allowlist. (The
+    # curated search reads the SAME key once PR #76 lands its _build_query
+    # enforcement; on this branch only api_get consults it.)
     allowed_orgs: list[str] = Field(default_factory=list)
 
     @field_validator("allowed_orgs")

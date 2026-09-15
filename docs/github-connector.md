@@ -173,13 +173,14 @@ membership check). The read is origin-locked
 turned off per hub with `api_get_enabled: false` without affecting the curated
 reads.
 
-`api/get` honors the same `connectors.github.allowed_orgs` allowlist as the
-curated search: when it is set, the read is confined to owner-qualified paths
-(`/repos`, `/orgs`, `/users`) under an allowed org, and paths that can read
-across orgs — `/search/*`, the `/user/*` self-endpoints, `/issues`, `/gists`,
-`/notifications` — are refused. An empty allowlist (the default) means the
-token's full visibility. Set `allowed_orgs` in real deploys so the generic read
-cannot reach outside your orgs.
+`api/get` honors the `connectors.github.allowed_orgs` allowlist: when it is set,
+the read is confined to owner-qualified paths (`/repos`, `/orgs`, `/users`) under
+an allowed org, and paths that can read across orgs — `/search/*`, the `/user/*`
+self-endpoints, `/issues`, `/gists`, `/notifications` — are refused (a redirect
+onto a disallowed owner is re-checked and refused too). An empty allowlist (the
+default) means the token's full visibility. Set `allowed_orgs` in real deploys so
+the generic read cannot reach outside your orgs. The curated search reads the
+same key once PR #76 lands; on this branch the allowlist governs `api/get`.
 
 The curated endpoints return no GitHub URL of any kind: all provider text is
 link-sanitized (bare domains included) and `repo`/`number` (not URLs) are what a

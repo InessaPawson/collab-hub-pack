@@ -304,8 +304,9 @@ class GitHubClient:
     ):
         self.access_token = access_token
         self.api_base_url = api_base_url.rstrip("/")
-        # Empty == the token's full visibility. When set, both the curated search
-        # and the generic api_get read are confined to these org logins.
+        # Empty == the token's full visibility. When set, the generic api_get
+        # read is confined to these org logins (and the curated search too, once
+        # PR #76 lands its _build_query enforcement — this branch scopes api_get).
         self.allowed_orgs = allowed_orgs or []
         self.timeout = httpx.Timeout(timeout_seconds)
         # api_get bounds the WHOLE call (validate + ≤3 hops) with this as an
@@ -838,6 +839,12 @@ class GitHubClient:
                                 current = self._resolve_api_redirect(
                                     current, response.headers.get("location", "")
                                 )
+                                # Re-apply the org allowlist to the redirect TARGET.
+                                # _resolve_api_redirect checks only origin, so a
+                                # same-origin 301 (a repo renamed or transferred to a
+                                # new owner) could otherwise land on an owner the
+                                # initial-path check at line 790 never saw.
+                                self._enforce_api_get_org_scope(self._base_relative_path(current))
                                 continue
                             return await self._read_api_result(response, media_type, resolved_max)
         except TimeoutError as exc:
@@ -911,6 +918,17 @@ class GitHubClient:
             f"({', '.join(self.allowed_orgs)}) permits only /repos, /orgs, and "
             "/users paths under those owners"
         )
+
+    def _base_relative_path(self, url: httpx.URL) -> str:
+        """Strip the API base's own path prefix (e.g. a GHE/proxy ``/api``) off a
+        same-origin URL, yielding the leading-``/`` path the request-time
+        validators expect. For the default ``https://api.github.com`` base (no
+        prefix) the path is returned unchanged."""
+        prefix = httpx.URL(self.api_base_url).path.rstrip("/")
+        path = url.path
+        if prefix and path.startswith(prefix):
+            path = path[len(prefix):]
+        return path if path.startswith("/") else "/" + path
 
     def _resolve_api_redirect(self, current: httpx.URL, location: str) -> httpx.URL:
         """Follow a redirect ONLY back to the same origin; refuse anything else.
