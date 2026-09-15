@@ -163,6 +163,15 @@ _API_GET_406_GUIDANCE = (
     "files omit their patch field"
 )
 _API_GET_DEPTH_GUARD = 30
+# The COMPLETE set of GitHub REST collections whose second path segment is an
+# owner (org or user) login. A configured org allowlist admits only these three
+# under an allowed owner and refuses everything else — search, the /user self-
+# endpoints, /issues, /gists, /notifications, … — by construction, so a new
+# cross-org endpoint is refused without a code change (the deliberate trade: a
+# new legitimately owner-scoped prefix would need adding here). GitHub's org and
+# user login namespace is shared, so /users/{login} is admitted when {login} is
+# in the (org-named) allowlist.
+_API_GET_OWNER_SCOPED_COLLECTIONS = ("repos", "orgs", "users")
 
 # --- Project board counts ---------------------------------------------------
 # Projects V2 GraphQL has NO group-by aggregate; the only server-side counter is
@@ -308,6 +317,9 @@ class GitHubClient:
         # read is confined to these org logins (and the curated search too, once
         # PR #76 lands its _build_query enforcement — this branch scopes api_get).
         self.allowed_orgs = allowed_orgs or []
+        # Case-folded lookup set, computed once (GitHub logins are case-
+        # insensitive); allowed_orgs is kept raw for display in refusal messages.
+        self._allowed_orgs_normalized = {org.strip().lower() for org in self.allowed_orgs}
         self.timeout = httpx.Timeout(timeout_seconds)
         # api_get bounds the WHOLE call (validate + ≤3 hops) with this as an
         # overall deadline, so a slow redirect chain can't blow the apollo cap.
@@ -888,35 +900,27 @@ class GitHubClient:
         this an injected agent could reach ``/search/*``, the ``/user/*``
         self-endpoints, or ``/repos/{any-owner}/...`` at the token's FULL
         visibility -- walking around the very allowlist the curated search
-        enforces (issue #64). Mirrors that policy: an empty allowlist == the
-        token's full visibility; a nonempty allowlist admits ONLY paths whose
-        owner segment is provably in the allowlist.
-
-        This is stricter than a per-endpoint denylist by construction: rather
-        than enumerate every cross-org endpoint (``/search/*``, ``/user/*``,
-        ``/issues``, ``/gists``, ``/notifications``, ...), it admits only the
-        owner-qualified collections (``/repos``, ``/orgs``, ``/users``) under an
-        allowed owner and refuses everything else -- so a future endpoint that
-        reads across orgs is refused without a code change. GitHub logins are
-        case-insensitive, so both sides are lowercased.
+        enforces (issue #64). An empty allowlist == the token's full visibility;
+        a nonempty one admits ONLY an owner-qualified collection
+        (:data:`_API_GET_OWNER_SCOPED_COLLECTIONS`) under an allowed owner.
         """
-        if not self.allowed_orgs:
+        if not self._allowed_orgs_normalized:
             return
         # _validate_api_path already guaranteed a leading "/", no "//", and no
         # ".." segment, so a simple split yields clean, non-empty segments.
         segments = [segment for segment in path.split("/") if segment]
-        allowed = {org.strip().lower() for org in self.allowed_orgs}
-        if len(segments) >= 2 and segments[0] in ("repos", "orgs", "users"):
-            if segments[1].lower() in allowed:
-                return
+        owner_scoped = len(segments) >= 2 and segments[0] in _API_GET_OWNER_SCOPED_COLLECTIONS
+        if owner_scoped and segments[1].lower() in self._allowed_orgs_normalized:
+            return
+        allowlist = ", ".join(self.allowed_orgs)
+        if owner_scoped:
             raise GitHubApiRequestError(
                 f"path targets {segments[1]!r}, which is outside the configured "
-                f"GitHub org allowlist ({', '.join(self.allowed_orgs)})"
+                f"GitHub org allowlist ({allowlist})"
             )
         raise GitHubApiRequestError(
             "this path is not scoped to an allowed org — the configured allowlist "
-            f"({', '.join(self.allowed_orgs)}) permits only /repos, /orgs, and "
-            "/users paths under those owners"
+            f"({allowlist}) permits only /repos, /orgs, and /users paths under those owners"
         )
 
     def _base_relative_path(self, url: httpx.URL) -> str:
