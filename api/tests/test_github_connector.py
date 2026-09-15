@@ -1798,6 +1798,89 @@ async def test_api_get_rejects_bad_paths(monkeypatch, bad_path):
         await _api_client().api_get(path=bad_path)
 
 
+def _scoped_api_client(orgs: list[str]) -> GitHubClient:
+    return GitHubClient(access_token=STATIC_TOKEN, api_base_url=_API_BASE, allowed_orgs=orgs)
+
+
+async def test_api_get_allowlist_admits_owner_qualified_paths(monkeypatch):
+    captured = {}
+
+    def handler(request: httpx.Request) -> Response:
+        captured["path"] = request.url.path
+        return _json_response({"ok": True})
+
+    _install_mock_client(monkeypatch, handler)
+    client = _scoped_api_client(["acme"])
+    for path in ("/repos/acme/widgets/pulls/1", "/orgs/acme/members", "/users/acme/repos"):
+        result = await client.api_get(path=path)
+        assert result.body == {"ok": True}
+
+
+async def test_api_get_allowlist_is_case_insensitive(monkeypatch):
+    def handler(request: httpx.Request) -> Response:
+        return _json_response({"ok": True})
+
+    _install_mock_client(monkeypatch, handler)
+    # Config value cased one way, path cased the other -- GitHub logins are
+    # case-insensitive, so this must be admitted.
+    result = await _scoped_api_client(["Acme"]).api_get(path="/repos/ACME/widgets")
+    assert result.body == {"ok": True}
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/repos/other/widgets/pulls/1",
+        "/orgs/other/members",
+        "/users/other/repos",
+    ],
+)
+async def test_api_get_rejects_owner_outside_allowlist(monkeypatch, path):
+    def handler(request: httpx.Request) -> Response:  # pragma: no cover - must not be reached
+        return _json_response({})
+
+    _install_mock_client(monkeypatch, handler)
+    with pytest.raises(GitHubApiRequestError, match="allowlist"):
+        await _scoped_api_client(["acme"]).api_get(path=path)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/search/issues",
+        "/search/code",
+        "/search/repositories",
+        "/user",
+        "/user/repos",
+        "/user/emails",
+        "/issues",
+        "/gists",
+        "/notifications",
+        "/repositories",
+    ],
+)
+async def test_api_get_allowlist_refuses_non_owner_scoped_paths(monkeypatch, path):
+    def handler(request: httpx.Request) -> Response:  # pragma: no cover - must not be reached
+        return _json_response({})
+
+    _install_mock_client(monkeypatch, handler)
+    with pytest.raises(GitHubApiRequestError, match="allowed org"):
+        await _scoped_api_client(["acme"]).api_get(path=path)
+
+
+async def test_api_get_empty_allowlist_admits_any_path(monkeypatch):
+    def handler(request: httpx.Request) -> Response:
+        return _json_response({"ok": True})
+
+    _install_mock_client(monkeypatch, handler)
+    # Empty allowlist == the token's full visibility (existing behavior): a
+    # cross-org path and a search path both go through unchanged.
+    client = _api_client()
+    for path in ("/repos/anyone/x", "/search/issues", "/user"):
+        result = await client.api_get(path=path)
+        assert result.body == {"ok": True}
+
+
 async def test_api_get_follows_same_host_redirect(monkeypatch):
     seen = []
 
@@ -2408,6 +2491,37 @@ async def test_api_get_route_happy(tmp_path, monkeypatch):
     assert body["content_trust"] == "external_untrusted"
     assert body["security_notice"]
     assert body["status"] == 200
+
+
+async def test_api_get_route_enforces_allowed_orgs(tmp_path, monkeypatch):
+    def handler(request: httpx.Request) -> Response:
+        return _json_response({"ok": True})
+
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path, allowed_orgs=["acme"]))
+    async with _client(app) as client:
+        # An owner inside the allowlist goes through.
+        ok = await client.post(
+            _API_GET_ROUTE, headers=_auth_header(), json={"path": "/repos/acme/widgets/pulls/7"}
+        )
+        assert ok.status_code == 200
+        # An owner outside the allowlist is refused as a 422 (not silently run at
+        # full token visibility) -- the wiring from config -> client -> enforcement.
+        blocked = await client.post(
+            _API_GET_ROUTE, headers=_auth_header(), json={"path": "/repos/other/secret/pulls/1"}
+        )
+        assert blocked.status_code == 422
+        assert "allowlist" in blocked.json()["detail"]
+        # A search path can read across orgs, so it is refused under an allowlist.
+        search = await client.post(
+            _API_GET_ROUTE, headers=_auth_header(), json={"path": "/search/issues"}
+        )
+        assert search.status_code == 422
+
+
+def test_github_config_rejects_invalid_allowed_org(tmp_path) -> None:
+    with pytest.raises(ValidationError):
+        _config(tmp_path, allowed_orgs=["acme OR repo:other/private"])
 
 
 async def test_api_get_route_coerces_params(tmp_path, monkeypatch):

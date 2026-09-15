@@ -173,6 +173,14 @@ membership check). The read is origin-locked
 turned off per hub with `api_get_enabled: false` without affecting the curated
 reads.
 
+`api/get` honors the same `connectors.github.allowed_orgs` allowlist as the
+curated search: when it is set, the read is confined to owner-qualified paths
+(`/repos`, `/orgs`, `/users`) under an allowed org, and paths that can read
+across orgs — `/search/*`, the `/user/*` self-endpoints, `/issues`, `/gists`,
+`/notifications` — are refused. An empty allowlist (the default) means the
+token's full visibility. Set `allowed_orgs` in real deploys so the generic read
+cannot reach outside your orgs.
+
 The curated endpoints return no GitHub URL of any kind: all provider text is
 link-sanitized (bare domains included) and `repo`/`number` (not URLs) are what a
 follow-up read needs. This began as a workaround for a chat renderer that crashed

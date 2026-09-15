@@ -139,13 +139,20 @@ own review).
   startup, so flipping it off during an incident requires a **redeploy/restart**,
   not a live config reload — ratify default-True knowing the kill switch is not
   instant.
-- **(b) Connector-granular agent grants, at full user-token scope.** Any agent
-  with GitHub read gets `api/get`; nothing binds the reachable `path` to the
-  agent's frame/org/repo, and the actor is the possibly-injected agent, not the
-  user. So an injected agent reaches EVERY endpoint the user's token scopes cover,
-  with no per-agent/repo/org narrowing. Ratify explicitly — or choose an
-  alternative the current design omits: a separate opt-in grant for the generic
-  read, or a per-request repo/org allow-list bound to the agent's frame.
+- **(b) Org allowlist enforced; residual scope is the token's within it.** The
+  generic read honors the same `connectors.github.allowed_orgs` allowlist as the
+  curated search (issue #64 / PR #76): with it set, `api/get` admits ONLY
+  owner-qualified paths (`/repos`, `/orgs`, `/users`) under an allowed owner and
+  refuses everything that can read across orgs — `/search/*`, the `/user/*`
+  self-endpoints, `/issues`, `/gists`, `/notifications`, etc. (positive allowlist,
+  so a future cross-org endpoint is refused without a code change). This closes
+  the earlier gap where the generic read walked around the curated allowlist.
+  Residual, ratified: (1) an EMPTY allowlist == the token's full visibility (the
+  project-wide default, matching #76 — real deploys set `allowed_orgs`); (2)
+  within an allowed org, nothing further binds the reachable `path` to the agent's
+  frame/repo, and the actor is the possibly-injected agent, not the user, so an
+  injected agent still reaches every in-allowlist endpoint the token scopes cover.
+  A per-agent/frame repo binding remains a possible future narrowing.
 - **(c) 50k ceiling + media-aware defaults** (json 20k / diff 50k) accepted as the
   v1 limit; the fallback for a bigger diff is `/pulls/{n}/files` (paginated).
 - **(d) Abuse observability = the structured events; GitHub-side rate budgets
@@ -173,7 +180,10 @@ read-only-private scope) plus whatever `read:org`/`user` the link grants, so the
 reachable READ surface is far wider than the six curated shapes: every private
 repo of every accessible org, org membership, collaborator/team lists, secret
 *names*, deploy-key metadata, `/user/emails`. The GET lock excludes writes; it
-does not narrow this read set. The NET-NEW risk vs the curated tools is
+does not by itself narrow this read set — but a configured `allowed_orgs`
+allowlist does (decision (b)): with it set the reachable set collapses to
+owner-qualified paths under the allowed orgs, and `/user/emails` and the other
+cross-org endpoints above are refused outright. The NET-NEW risk vs the curated tools is
 **injection-driven exfiltration with a wider aperture** — and the ACTOR driving
 the path is the (possibly prompt-injected) agent, not the user (decision (b)).
 Sanitization masks link *shapes* in what comes back; it does NOT neutralize

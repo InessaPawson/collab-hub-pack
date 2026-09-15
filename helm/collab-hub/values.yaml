@@ -575,6 +575,11 @@ connectors:
     apiBaseUrl: https://api.github.com
     # -- Timeout for broker and GitHub API requests.
     requestTimeoutSeconds: 10
+    # -- GitHub org logins to restrict search and the generic api/get read to.
+    # Empty = the token's full visibility (personal repos + every approved org).
+    # Set this so agent searches do not interleave personal and work results and
+    # the generic read cannot reach outside the allowlist.
+    allowedOrgs: []
     # -- Enable the generic GitHub read (api/get). The containment path for an
     # incident: set to false and redeploy/restart to disable it (read once at
     # startup, so this is not a live toggle).
