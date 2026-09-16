@@ -169,9 +169,10 @@ for diff, 50k ceiling) with `truncated` set when cut; a `202` with an empty body
 means GitHub is still computing the result — retry. A `204` with an empty body
 is an affirmative result with nothing to return (e.g. a collaborator/following
 membership check). The read is origin-locked
-(GET stays on the API host; archive/binary redirects are refused) and can be
-turned off per hub with `api_get_enabled: false` without affecting the curated
-reads.
+(GET stays on the API host; archive/binary redirects are refused). It ships
+**off by default** (fail-closed): enable it per hub with `api_get_enabled: true`
+— ideally alongside a set `allowed_orgs` — without affecting the curated reads,
+which stay on regardless.
 
 `api/get` honors the `connectors.github.allowed_orgs` allowlist: when it is set,
 the read is confined to owner-qualified paths (`/repos`, `/orgs`, `/users`) under

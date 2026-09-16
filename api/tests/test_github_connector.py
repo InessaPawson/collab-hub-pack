@@ -54,6 +54,9 @@ def _config(tmp_path, **github) -> Config:
     github_config = {
         "static_access_token": STATIC_TOKEN,
         "api_base_url": "https://github.test/api",
+        # Generic read ships opt-in (default False); the feature tests enable it
+        # explicitly. The disabled-path test overrides this back to False.
+        "api_get_enabled": True,
         **github,
     }
     return Config.parse(
@@ -2733,6 +2736,25 @@ async def test_api_get_route_disabled_is_403(tmp_path, monkeypatch):
         response = await client.post(_API_GET_ROUTE, headers=_auth_header(), json={"path": "/repos/a/b"})
     assert response.status_code == 403
     assert "disabled" in response.json()["detail"].lower()
+
+
+def test_api_get_disabled_by_default(tmp_path):
+    # Generic read ships opt-in: a hub that never sets api_get_enabled must not
+    # gain full-token-visibility read on upgrade. (_config forces it on for the
+    # feature tests, so build the config directly here.)
+    config = Config.parse(
+        {
+            "storage": {"frames_path": str(tmp_path / "frames")},
+            "frames": {"active_state": {"backend": "memory"}, "mcp_session_manager_enabled": False},
+            "connectors": {
+                "github": {
+                    "static_access_token": STATIC_TOKEN,
+                    "api_base_url": "https://github.test/api",
+                }
+            },
+        }
+    )
+    assert config.connectors.github.api_get_enabled is False
 
 
 async def test_api_get_route_requires_auth(tmp_path, monkeypatch):

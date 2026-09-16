@@ -45,10 +45,14 @@ None of these are model-controllable: the request model exposes only
    a still-malformed path is caught as `httpx.InvalidURL` and refused (422), never a 500.
    Redirects are followed ONLY back to the same origin — scheme `https`, same
    host, same port, no userinfo — resolved through `httpx.URL.join` (never a
-   string prefix match), ≤3 hops, auth kept. A renamed-repo 301 (stays on the API
-   host) works; a codeload/storage hop, an `https→http` downgrade, or a
-   `host@evil` userinfo spoof is refused. Enforced: `_validate_api_path`,
-   `_resolve_api_redirect`. Tested: `test_api_get_rejects_bad_paths` (18 cases),
+   string prefix match), ≤3 hops, auth kept. With an EMPTY `allowed_orgs`, a
+   renamed-repo 301 (stays on the API host) is followed; a codeload/storage hop,
+   an `https→http` downgrade, or a `host@evil` userinfo spoof is refused. Note
+   the org-scope interaction: a real rename/transfer 301 targets the numeric
+   `/repositories/{id}` route, which a NONEMPTY allowlist refuses (owner not
+   name-resolvable) — the right fail-closed trade, so renamed-repo follow is an
+   empty-allowlist-only property. Enforced: `_validate_api_path`,
+   `_resolve_api_redirect`, `_enforce_api_get_org_scope` (re-run per hop). Tested: `test_api_get_rejects_bad_paths` (18 cases),
    the five redirect tests (same-host follow, hop cap, cross-host refuse,
    downgrade refuse, userinfo-spoof refuse).
 
@@ -85,8 +89,8 @@ None of these are model-controllable: the request model exposes only
 
 5. **Pre-parse byte cap (memory-safety).** The body is STREAMED and aborted
    past `max_chars*4 + 1` bytes, so parse-then-truncate never buffers an unbounded
-   upstream (`/git/trees?recursive=1` is the attack). Enforced: `_read_capped`
-   (mirrors drive_client's `aiter_bytes` pattern). Tested:
+   upstream (`/git/trees?recursive=1` is the attack). Enforced: `read_capped`
+   (in `http_stream.py`, shared with drive_client's `aiter_bytes` pattern). Tested:
    `test_api_get_aborts_oversized_body` asserts the stream is abandoned early, not
    fully drained.
 
@@ -94,8 +98,9 @@ None of these are model-controllable: the request model exposes only
    plus a token-broker fetch, so unbounded concurrent calls from an injected agent
    could exhaust the hub's sockets/FDs/memory. A process-wide `asyncio.Semaphore`
    sized by `api_get_max_concurrency` (default 8) bounds concurrent generic reads;
-   curated tools are unaffected. Enforced: `_api_get_semaphore` + the `async with`
-   around the client call in `routers/connectors.py`.
+   curated tools are unaffected. Enforced: `app.state.github_api_get_semaphore`
+   (created in `core.py`'s lifespan) + the `async with` around the client call in
+   `routers/connectors.py`.
 
 Two more properties fall out of the above:
 - **Content-Type keying, not status keying.** Dispatch is on
@@ -132,13 +137,15 @@ own review).
 
 ## Explicit decisions for sign-off (please ratify or redirect)
 
-- **(a) `api_get_enabled` default = True.** Reads are ungated today (consistent
-  with the curated tools); writes gate (default False) in the separate write
-  epic. Flipping the generic read to opt-in (default False) is a one-line change
-  if security prefers it. **Containment latency:** the flag is read once at
-  startup, so flipping it off during an incident requires a **redeploy/restart**,
-  not a live config reload — ratify default-True knowing the kill switch is not
-  instant.
+- **(a) `api_get_enabled` default = False (fail-closed, opt-in).** The generic
+  read ships OFF: an upgraded hub gains full-token-visibility long-tail read only
+  after an operator explicitly enables it, ideally alongside a set `allowed_orgs`
+  — so the default posture on upgrade is no wider aperture, not a wider one. The
+  curated tools are unaffected (they gate on `broker_token_url`). **Containment
+  latency:** the flag is read once at startup, so toggling it — on to adopt, or
+  off during an incident — requires a **redeploy/restart**, not a live config
+  reload. Ratify opt-in-default knowing enabling and the kill switch are both
+  deploy-time, not instant.
 - **(b) Org allowlist enforced; residual scope is the token's within it.** The
   generic read honors the same `connectors.github.allowed_orgs` allowlist as the
   curated search (issue #64 / PR #76): with it set, `api/get` admits ONLY
