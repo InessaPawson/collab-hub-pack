@@ -637,7 +637,8 @@ def make_app(config: BaseConfig) -> FastAPI:
         # costs the reviewed entry in PUBLIC_WEB_PATHS — make_router refuses
         # a public page route that is missing it.
         invite_public, invite_gated = invite.make_routers(
-            memberships_enabled=org_source_resolves_membership()
+            memberships_enabled=org_source_resolves_membership(),
+            require_verified_email=config.frames.invitations.require_verified_email,
         )
         # The operator invitation page (issue #91). Mounted only where
         # invitations can mean anything, for the same reason #89's API router
