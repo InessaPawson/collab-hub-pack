@@ -188,6 +188,14 @@ spec:
               value: {{ .Values.connectors.github.apiGetEnabled | quote }}
             - name: COLLAB_HUB_API__CONNECTORS__GITHUB__API_GET_MAX_CONCURRENCY
               value: {{ .Values.connectors.github.apiGetMaxConcurrency | quote }}
+            - name: COLLAB_HUB_API__CONNECTORS__NOTION__BROKER_TOKEN_URL
+              value: {{ .Values.connectors.notion.brokerTokenUrl | quote }}
+            - name: COLLAB_HUB_API__CONNECTORS__NOTION__API_BASE_URL
+              value: {{ .Values.connectors.notion.apiBaseUrl | quote }}
+            - name: COLLAB_HUB_API__CONNECTORS__NOTION__NOTION_VERSION
+              value: {{ .Values.connectors.notion.notionVersion | quote }}
+            - name: COLLAB_HUB_API__CONNECTORS__NOTION__REQUEST_TIMEOUT_SECONDS
+              value: {{ .Values.connectors.notion.requestTimeoutSeconds | quote }}
             {{- with .Values.frames.auth.idToken.jwksUrl }}
             - name: FRAMES_IDTOKEN_JWKS_URL
               value: {{ . | quote }}
