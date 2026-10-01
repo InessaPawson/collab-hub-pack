@@ -24,6 +24,7 @@ from collab_hub_api.connectors.models import (
     GITHUB_READONLY_SCOPES,
     GitHubApiGetRequest,
     GitHubApiGetResponse,
+    GitHubProjectReadRequest,
     GitHubSearchRequest,
 )
 from collab_hub_api.core import make_app
@@ -1066,6 +1067,113 @@ async def test_github_read_project_auto_paginates(tmp_path, monkeypatch):
     assert body["truncated"] is False
 
 
+async def test_github_read_project_default_requests_small_page(tmp_path, monkeypatch):
+    # The default read asks GitHub for one small page, not a 100-item page
+    # walked up to five times.
+    seen: list[dict] = []
+    _install_mock_client(monkeypatch, _counts_handler(read_node=_read_node(), read_variables=seen))
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        await client.post(
+            "/v1/connectors/github/projects/1/read", headers=_auth_header(), json={"owner": "openteams-ai"}
+        )
+    expected = GitHubProjectReadRequest.model_fields["max_items"].default
+    assert [v["first"] for v in seen] == [expected]
+
+
+async def test_github_read_project_forwards_item_query(tmp_path, monkeypatch):
+    seen: list[dict] = []
+    _install_mock_client(monkeypatch, _counts_handler(read_node=_read_node(), read_variables=seen))
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(
+            "/v1/connectors/github/projects/1/read",
+            headers=_auth_header(),
+            json={"owner": "openteams-ai", "query": ' status:"In Progress" '},
+        )
+    assert seen[0]["query"] == 'status:"In Progress"'
+    assert response.json()["query"] == 'status:"In Progress"'  # echoed, normalised
+
+
+def _board_node(*, board_total: int, matched: int | None = None, nodes: list | None = None) -> dict:
+    """_read_node() with an explicit unfiltered `board` size and a (possibly
+    narrower) `items` connection, as a filtered read returns them."""
+    node = _read_node()
+    node["projectV2"]["board"] = {"totalCount": board_total}
+    items = node["projectV2"]["items"]
+    if nodes is not None:
+        items["nodes"] = nodes
+    items["totalCount"] = len(items["nodes"]) if matched is None else matched
+    return node
+
+
+async def test_github_read_project_filtered_totals_stay_board_wide(tmp_path, monkeypatch):
+    # A filter narrows `items` (and their connection totalCount), but the
+    # board size must still come back as project.items_count / total_count so
+    # the two totals the caller sees don't silently change meaning. The filtered
+    # count is reported separately as matched_count and drives `truncated`.
+    node = _board_node(board_total=40, matched=7)  # 2 of the 7 matches returned
+    _install_mock_client(monkeypatch, _counts_handler(read_node=node, aggregates={"total": 40}))
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(
+            "/v1/connectors/github/projects/1/read",
+            headers=_auth_header(),
+            json={"owner": "openteams-ai", "query": "is:open"},
+        )
+    body = response.json()
+    assert body["project"]["items_count"] == 40
+    assert body["total_count"] == 40
+    assert body["matched_count"] == 7
+    assert len(body["items"]) == 2
+    assert body["truncated"] is True
+
+
+async def test_github_read_project_filter_matching_nothing_is_not_an_empty_board(tmp_path, monkeypatch):
+    # GitHub answers an unrecognised/mistyped filter with zero items and no
+    # error. The response must still show the board is non-empty.
+    node = _board_node(board_total=40, nodes=[])
+    _install_mock_client(monkeypatch, _counts_handler(read_node=node, aggregates={"total": 40}))
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(
+            "/v1/connectors/github/projects/1/read",
+            headers=_auth_header(),
+            json={"owner": "openteams-ai", "query": "staus:Done"},
+        )
+    body = response.json()
+    assert body["items"] == []
+    assert body["matched_count"] == 0
+    assert body["total_count"] == 40
+    assert body["truncated"] is False
+    assert body["query"] == "staus:Done"
+
+
+async def test_github_read_project_unfiltered_matched_equals_total(tmp_path, monkeypatch):
+    _install_mock_client(monkeypatch, _counts_handler(read_node=_board_node(board_total=2)))
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        body = (
+            await client.post(
+                "/v1/connectors/github/projects/1/read", headers=_auth_header(), json={"owner": "openteams-ai"}
+            )
+        ).json()
+    assert body["query"] == ""
+    assert body["matched_count"] == body["total_count"] == 2
+
+
+async def test_github_read_project_rejects_oversized_query(tmp_path, monkeypatch):
+    _install_mock_client(monkeypatch, _graphql_handler(org=_read_node(), user=None))
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(
+            "/v1/connectors/github/projects/1/read",
+            headers=_auth_header(),
+            json={"owner": "openteams-ai", "query": "x" * 257},
+        )
+    assert response.status_code == 422
+
+
 async def test_github_project_owner_not_found(tmp_path, monkeypatch):
     _install_mock_client(monkeypatch, _graphql_handler(org=None, user=None))
     app = make_app(_config(tmp_path))
@@ -1200,18 +1308,32 @@ async def test_github_read_project_item_assignees_and_labels(tmp_path, monkeypat
     assert items[1]["assignees"] == [] and items[1]["labels"] == []
 
 
-def _counts_handler(*, read_node, options, aggregates, status_counts, fail_dsl=False, captured_variables=None):
+def _counts_handler(
+    *,
+    read_node,
+    options=(),
+    aggregates=None,
+    status_counts=(),
+    fail_dsl=False,
+    captured_variables=None,
+    read_variables=None,
+):
     """Route POST /graphql three ways by GraphQL operation name: the enumeration
     read (ProjectRead), the aggregate count query (ProjectCounts), and the
     per-status column query (ProjectStatusCounts). fail_dsl simulates the
     board-filter DSL being rejected by the API, so the count path falls back to
-    sampling the enumerated items."""
+    sampling the enumerated items. read_variables, when given a list, collects
+    the variables of every ProjectRead call so a test can assert on the page
+    size or item filter the client actually sent."""
+    aggregates = aggregates or {}
 
     def handler(request: httpx.Request) -> Response:
         if not request.url.path.endswith("/graphql"):
             return Response(404, json={"message": "Not Found"})
         payload = json.loads(request.content.decode("utf-8"))
         query = payload["query"]
+        if "ProjectRead" in query and read_variables is not None:
+            read_variables.append(payload["variables"])
         if "ProjectStatusCounts" in query:
             if captured_variables is not None:
                 captured_variables.update(payload["variables"])
@@ -2821,3 +2943,273 @@ async def test_api_get_route_logs_refusal(tmp_path, monkeypatch, caplog):
             )
     assert response.status_code == 422
     assert any(r.msg == "github_api_get_refusal" for r in caplog.records)
+
+
+def _paged_board_handler(nodes: list[dict], *, counts_status: int | str = 200, calls: list[tuple] | None = None):
+    """A board of `nodes` served page by page, honouring `first`/`after` (the
+    cursor is the integer offset) for both the full read and the slim
+    counting-sample query. The aggregate count queries answer with a GraphQL
+    error (the DSL-rejected shape); counts_status=429 makes them a REST-shaped
+    rate limit, "graphql-rate-limit" the HTTP-200 errors[] RATE_LIMITED shape,
+    502 a server error and "timeout" a transport timeout -- so every request
+    lands in the sampled fallback. `calls` collects (operation, first, after)
+    per enumeration request."""
+
+    def handler(request: httpx.Request) -> Response:
+        if not request.url.path.endswith("/graphql"):
+            return Response(404, json={"message": "Not Found"})
+        payload = json.loads(request.content.decode("utf-8"))
+        query, variables = payload["query"], payload["variables"]
+        if "ProjectCounts" in query:
+            if counts_status == 429:
+                return Response(429, headers={"retry-after": "30"}, json={"message": "rate limited"})
+            if counts_status == "graphql-rate-limit":
+                return Response(
+                    200,
+                    json={
+                        "data": None,
+                        "errors": [{"type": "RATE_LIMITED", "message": "API rate limit exceeded"}],
+                    },
+                )
+            if counts_status == 502:
+                return Response(502, json={"message": "bad gateway"})
+            if counts_status == "timeout":
+                raise httpx.ReadTimeout("timed out", request=request)
+            return Response(200, json={"errors": [{"message": "unknown query filter"}]})
+        op = "ProjectCountSample" if "ProjectCountSample" in query else "ProjectRead"
+        start = int(variables.get("after") or 0)
+        stop = start + variables["first"]
+        if calls is not None:
+            calls.append((op, variables["first"], variables.get("after")))
+        node = {
+            "projectV2": {
+                "number": 1,
+                "title": "Roadmap",
+                "board": {"totalCount": len(nodes)},
+                "items": {
+                    "totalCount": len(nodes),
+                    "nodes": nodes[start:stop],
+                    "pageInfo": {"hasNextPage": stop < len(nodes), "endCursor": str(stop)},
+                },
+            }
+        }
+        return Response(200, json={"data": {"organization": node, "user": None}})
+
+    return handler
+
+
+def _board_items(n: int) -> list[dict]:
+    """n alternating open issues / closed PRs in the Todo column."""
+    issue = {"type": "ISSUE", "content": {"__typename": "Issue", "state": "OPEN"}}
+    pr = {"type": "PULL_REQUEST", "content": {"__typename": "PullRequest", "state": "CLOSED"}}
+    status = {"fieldValues": {"nodes": [{"name": "Todo", "field": {"name": "Status"}}]}}
+    return [{**(issue if i % 2 == 0 else pr), **status} for i in range(n)]
+
+
+async def test_github_read_project_fallback_resumes_from_cursor_with_slim_query(tmp_path, monkeypatch):
+    # Count queries fail and the default read returned only part of the board:
+    # the fallback must continue from the read cursor with the counting-only
+    # query (not re-fetch the items in hand, not re-fetch titles/assignees/labels)
+    # and bucket the already-held items plus the remainder.
+    calls: list[tuple] = []
+    _install_mock_client(monkeypatch, _paged_board_handler(_board_items(7), calls=calls))
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(
+            "/v1/connectors/github/projects/1/read",
+            headers=_auth_header(),
+            json={"owner": "openteams-ai", "max_items": 3},
+        )
+    body = response.json()
+    assert len(body["items"]) == 3 and body["truncated"] is True
+    assert calls == [("ProjectRead", 3, None), ("ProjectCountSample", 100, "3")]
+    counts = body["counts"]
+    assert counts["authoritative"] is True and counts["counted_items"] == 7
+    assert counts["by_type"] == {"issue": 4, "pull_request": 3, "draft": 0, "redacted": 0}
+    assert counts["by_state"] == {"open": 4, "closed": 3}
+    assert counts["by_status"] == [{"name": "Todo", "count": 7}]
+
+
+def test_github_project_count_sample_query_is_slim():
+    from collab_hub_api.connectors.github_client import _PROJECT_COUNT_SAMPLE_QUERY
+
+    for heavy in ("title", "assignees", "labels", "repository", "TextValue", "DateValue", "NumberValue"):
+        assert heavy not in _PROJECT_COUNT_SAMPLE_QUERY
+
+
+async def test_github_read_project_filtered_fallback_samples_whole_board(tmp_path, monkeypatch):
+    # A filtered read's items can't stand in for the board, so the sample starts
+    # from the top -- but still with the slim query, and still within the ceiling.
+    calls: list[tuple] = []
+    _install_mock_client(monkeypatch, _paged_board_handler(_board_items(4), calls=calls))
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(
+            "/v1/connectors/github/projects/1/read",
+            headers=_auth_header(),
+            json={"owner": "openteams-ai", "query": "is:open", "max_items": 2},
+        )
+    assert [c[0] for c in calls] == ["ProjectRead", "ProjectCountSample"]
+    assert calls[1][2] is None  # from the top, not from the filtered read cursor
+    counts = response.json()["counts"]
+    assert counts["authoritative"] is True and counts["counted_items"] == 4
+
+
+async def test_github_read_project_fallback_makes_no_requests_when_rate_limited(tmp_path, monkeypatch):
+    # If the count queries failed because GitHub is throttling, walking the
+    # board would add load exactly when it hurts. Bucket what came back (and
+    # say so) instead of enumerating further.
+    calls: list[tuple] = []
+    _install_mock_client(monkeypatch, _paged_board_handler(_board_items(7), counts_status=429, calls=calls))
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        unfiltered = await client.post(
+            "/v1/connectors/github/projects/1/read",
+            headers=_auth_header(),
+            json={"owner": "openteams-ai", "max_items": 3},
+        )
+        filtered = await client.post(
+            "/v1/connectors/github/projects/1/read",
+            headers=_auth_header(),
+            json={"owner": "openteams-ai", "max_items": 3, "query": "is:open"},
+        )
+    assert [c[0] for c in calls] == ["ProjectRead", "ProjectRead"]  # no counting walk either time
+    counts = unfiltered.json()["counts"]
+    assert counts["authoritative"] is False and counts["counted_items"] == 3 and counts["total"] == 7
+    counts = filtered.json()["counts"]
+    assert counts["authoritative"] is False and counts["counted_items"] == 0 and counts["total"] == 7
+
+
+@pytest.mark.parametrize("counts_status", ["graphql-rate-limit", 502, "timeout"])
+async def test_github_read_project_fallback_skips_walk_when_upstream_is_failing(tmp_path, monkeypatch, counts_status):
+    # GraphQL delivers its rate limit as HTTP 200 + errors[].type RATE_LIMITED,
+    # not 429; and a 5xx or a timeout on the count queries is just as likely to
+    # hit the counting walk. None of these should cost up to five more
+    # round-trips on a read that already succeeded.
+    calls: list[tuple] = []
+    _install_mock_client(monkeypatch, _paged_board_handler(_board_items(7), counts_status=counts_status, calls=calls))
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(
+            "/v1/connectors/github/projects/1/read",
+            headers=_auth_header(),
+            json={"owner": "openteams-ai", "max_items": 3},
+        )
+    assert response.status_code == 200
+    assert [c[0] for c in calls] == ["ProjectRead"]
+    counts = response.json()["counts"]
+    assert counts["authoritative"] is False and counts["counted_items"] == 3 and counts["total"] == 7
+
+
+async def test_github_graphql_rate_limit_error_maps_to_429(tmp_path, monkeypatch):
+    # The read itself hitting the GraphQL-shaped limit must surface as the same
+    # 429 the REST limits do, not as a generic upstream failure.
+    def handler(request: httpx.Request) -> Response:
+        return Response(
+            200,
+            headers={"retry-after": "45"},
+            json={"data": None, "errors": [{"type": "RATE_LIMITED", "message": "API rate limit exceeded"}]},
+        )
+
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(
+            "/v1/connectors/github/projects/1/read", headers=_auth_header(), json={"owner": "openteams-ai"}
+        )
+    assert response.status_code == 429
+
+
+async def test_github_read_project_fallback_does_not_overshoot_ceiling(tmp_path, monkeypatch):
+    # max_items=500 on a bigger board already holds the ceiling's worth of
+    # items: the fallback must not issue one more (clamped to first=1) request
+    # that can't change the non-authoritative outcome.
+    calls: list[tuple] = []
+    _install_mock_client(monkeypatch, _paged_board_handler(_board_items(520), calls=calls))
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(
+            "/v1/connectors/github/projects/1/read",
+            headers=_auth_header(),
+            json={"owner": "openteams-ai", "max_items": 500},
+        )
+    assert [c[0] for c in calls] == ["ProjectRead"] * 5
+    counts = response.json()["counts"]
+    assert counts["authoritative"] is False and counts["counted_items"] == 500 and counts["total"] == 520
+
+
+async def test_github_read_project_pages_with_next_cursor(tmp_path, monkeypatch):
+    # A truncated read returns next_cursor; sending it back as `after` fetches
+    # the following items without re-reading the first page, and the last page
+    # reports next_cursor null.
+    calls: list[tuple] = []
+    _install_mock_client(monkeypatch, _paged_board_handler(_board_items(7), calls=calls))
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        first = await client.post(
+            "/v1/connectors/github/projects/1/read",
+            headers=_auth_header(),
+            json={"owner": "openteams-ai", "max_items": 3},
+        )
+        cursor = first.json()["next_cursor"]
+        assert first.json()["truncated"] is True and cursor == "3"
+        second = await client.post(
+            "/v1/connectors/github/projects/1/read",
+            headers=_auth_header(),
+            json={"owner": "openteams-ai", "max_items": 3, "after": cursor},
+        )
+        third = await client.post(
+            "/v1/connectors/github/projects/1/read",
+            headers=_auth_header(),
+            json={"owner": "openteams-ai", "max_items": 3, "after": second.json()["next_cursor"]},
+        )
+    assert [c for c in calls if c[0] == "ProjectRead"] == [
+        ("ProjectRead", 3, None),
+        ("ProjectRead", 3, "3"),
+        ("ProjectRead", 3, "6"),
+    ]
+    assert len(second.json()["items"]) == 3 and second.json()["next_cursor"] == "6"
+    assert len(third.json()["items"]) == 1 and third.json()["next_cursor"] is None
+    # A continuation's items are not the board's head, so its counts fallback
+    # samples from the top rather than resuming from the continuation cursor.
+    assert [c for c in calls if c[0] == "ProjectCountSample"][1][2] is None
+
+
+async def test_github_read_project_filtered_fallback_reports_nothing_when_rewalk_fails(tmp_path, monkeypatch):
+    # With a query, the returned items are a filtered subset and can't stand in
+    # for the board. If both the count queries and the counting re-walk fail,
+    # the counts must come back empty and non-authoritative -- not a breakdown
+    # of the filtered sample presented as board-wide.
+    calls = {"read": 0}
+
+    def handler(request: httpx.Request) -> Response:
+        if not request.url.path.endswith("/graphql"):
+            return Response(404, json={"message": "Not Found"})
+        payload = json.loads(request.content.decode("utf-8"))
+        if "ProjectCounts" in payload["query"]:
+            return Response(200, json={"errors": [{"message": "unknown query filter"}]})
+        calls["read"] += 1
+        if payload["variables"].get("query") is None:
+            return Response(502, json={"message": "bad gateway"})  # the unfiltered counting walk
+        return Response(200, json={"data": {"organization": _read_node(), "user": None}})
+
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(
+            "/v1/connectors/github/projects/1/read",
+            headers=_auth_header(),
+            json={"owner": "openteams-ai", "query": "is:open"},
+        )
+    assert response.status_code == 200
+    body = response.json()
+    counts = body["counts"]
+    assert calls["read"] == 2
+    assert counts["authoritative"] is False
+    assert counts["counted_items"] == 0
+    # Still the board total, and the fixed by_type / by_state keys stay present
+    # (zeroed) so a caller indexing them doesn't break on the degraded shape.
+    assert counts["total"] == body["total_count"] == 2
+    assert counts["by_status"] == []
+    assert counts["by_type"] == {"issue": 0, "pull_request": 0, "draft": 0, "redacted": 0}
+    assert counts["by_state"] == {"open": 0, "closed": 0}

@@ -617,25 +617,44 @@ class GitHubProjectsListResponse(UntrustedConnectorResponse):
 
 
 class GitHubProjectReadRequest(BaseModel):
-    # The read auto-paginates server-side up to this cap (GitHub caps a GraphQL
-    # page at 100; the client walks multiple pages). Default returns a whole
-    # board up to the 500 ceiling in one call; boards larger than the cap report
-    # truncated=True so the caller never mistakes a subset for the whole board.
+    # Default returns one GraphQL page. `counts` carries exact board-wide totals
+    # and per-column breakdowns regardless of how many items come back, so most
+    # board questions don't need the full listing. Callers that do can raise
+    # max_items up to the 500 ceiling; truncated=True marks a partial listing.
+    # `query` is an optional ProjectV2 item filter (GitHub's board filter DSL,
+    # e.g. 'status:"In Progress"' or 'assignee:octocat') that narrows the items
+    # returned; `counts` and `total_count` stay board-wide either way and the
+    # response echoes the filter as `query` with its `matched_count`.
+    # `after` continues a listing from a previous response's `next_cursor` (same
+    # owner, number and query), so items 51-100 cost one more page rather than
+    # a re-download of the first 50 under a larger max_items.
     owner: str = Field(min_length=1, max_length=100)
-    max_items: int = Field(default=500, ge=1, le=500)
+    max_items: int = Field(default=50, ge=1, le=500)
+    query: str = Field(default="", max_length=256)
+    after: str | None = Field(default=None, max_length=512)
 
 
 class GitHubProjectReadResponse(UntrustedConnectorResponse):
     project: GitHubProject
     items: list[GitHubProjectItem]
-    # total_count is the board's full item count; truncated is set when it
-    # exceeds the items returned here, so a caller never mistakes a partial
-    # board for the whole thing.
+    # query echoes the applied item filter ("" when none) so a reader can tell
+    # which items/matched_count refer to. total_count is ALWAYS the board's full
+    # size (same scalar as project.items_count and counts.total); matched_count
+    # is how many items the query selects (== total_count with no query).
+    # truncated is set when matched_count exceeds the items returned here, so a
+    # partial listing is never mistaken for the whole -- and a filter that
+    # matches nothing shows as matched_count=0 against a non-zero total_count,
+    # distinguishable from an empty board.
+    query: str = ""
     total_count: int = 0
+    matched_count: int = 0
     truncated: bool = False
-    # Aggregate breakdowns (per status column, by type, open/closed). Accurate
-    # regardless of the item truncation above: computed by server-side count
-    # queries when available, otherwise sampled and flagged non-authoritative.
+    # Opaque cursor after the last item returned; null once the listing is
+    # exhausted. Feed it back as `after` to page without re-reading.
+    next_cursor: str | None = None
+    # Board-wide aggregate breakdowns (per status column, by type, open/closed),
+    # independent of max_items and query: computed by server-side count queries
+    # when available, otherwise sampled and flagged non-authoritative.
     counts: GitHubProjectCounts | None = None
 
 

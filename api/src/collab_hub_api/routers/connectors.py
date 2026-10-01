@@ -767,8 +767,8 @@ async def read_github_project(
     try:
         # Counts run concurrently with the enumeration and never raise; only the
         # board read's own failure surfaces here to be mapped.
-        project, items, counts = await client.read_project_with_counts(
-            owner=body.owner, number=number, max_items=body.max_items
+        read = await client.read_project_with_counts(
+            owner=body.owner, number=number, max_items=body.max_items, query=body.query, after=body.after
         )
     except GitHubUpstreamError as exc:
         logger.info(
@@ -778,15 +778,19 @@ async def read_github_project(
         _raise_github_upstream(exc, not_found_detail=_GITHUB_NOT_FOUND_DETAIL)
     except httpx.HTTPError as exc:
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, "GitHub project read failed") from exc
-    # project.items_count is the board's full size; flag when we returned fewer
-    # so the caller doesn't reason over a partial board as if it were complete.
-    total = project.items_count
+    # total_count stays the board size (same scalar as project.items_count and
+    # counts.total); matched_count is what the query selected and drives
+    # truncated, so a filter that matched nothing on a non-empty board reads as
+    # matched_count=0 < total_count rather than as an empty board.
     return GitHubProjectReadResponse(
-        project=project,
-        items=items,
-        total_count=total,
-        truncated=total > len(items),
-        counts=counts,
+        project=read.project,
+        items=read.items,
+        query=body.query.strip(),
+        total_count=read.project.items_count,
+        matched_count=read.matched,
+        truncated=read.truncated,
+        next_cursor=read.cursor,
+        counts=read.counts,
     )
 
 
