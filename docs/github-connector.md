@@ -122,7 +122,11 @@ scalar as `project.items_count` and `counts.total`). `truncated` compares the
 returned items against `matched_count`. A filter that matches nothing -- GitHub
 silently returns zero for an unrecognised filter rather than an error -- shows
 as `matched_count: 0` against a non-zero `total_count`, so it can't be mistaken
-for an empty board. `counts` below stays board-wide regardless of either.
+for an empty board, and the response carries a `note` saying so and listing
+the board's real Status column names (GitHub matches `status:` values ignoring
+case but not emoji, so `status:"In Progress"` finds nothing on a board whose
+column is `In progress 🏗`). `counts` below stays board-wide regardless of
+either and is never what the filter matched.
 
 The read also returns a `counts` object with the board's aggregate breakdowns: an
 exact non-archived `total` (scope recorded in `archived_policy`), per-status-column

@@ -652,6 +652,13 @@ class GitHubProjectReadResponse(UntrustedConnectorResponse):
     # Opaque cursor after the last item returned; null once the listing is
     # exhausted. Feed it back as `after` to page without re-reading.
     next_cursor: str | None = None
+    # Set only when `query` matched nothing on a non-empty board. GitHub answers
+    # a mistyped or emoji-mismatched filter (e.g. status:"In Progress" on a
+    # board whose column is 'In progress 🏗') with zero items and no error, and
+    # in evals the model then read counts.by_status as the filter's result.
+    # The note says the filter matched 0 and lists the board's real Status
+    # column names so the caller can retry with one of them.
+    note: str = ""
     # Board-wide aggregate breakdowns (per status column, by type, open/closed),
     # independent of max_items and query: computed by server-side count queries
     # when available, otherwise sampled and flagged non-authoritative.

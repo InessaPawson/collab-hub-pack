@@ -1147,6 +1147,69 @@ async def test_github_read_project_filter_matching_nothing_is_not_an_empty_board
     assert body["total_count"] == 40
     assert body["truncated"] is False
     assert body["query"] == "staus:Done"
+    assert body["note"].startswith("The filter matched 0 of the board's 40 items")
+
+
+async def test_github_read_project_empty_filter_note_names_real_columns(tmp_path, monkeypatch):
+    # A real board (nebari-dev project 4) has a column 'In progress 🏗'; GitHub's
+    # filter ignores case but not emoji, so status:"In Progress" matches nothing
+    # while counts.by_status still shows the column. The note must say the
+    # filter matched 0 and name the actual columns, so the model does not report
+    # the counts figure as what the filter matched.
+    node = _board_node(board_total=40, nodes=[])
+    handler = _counts_handler(
+        read_node=node,
+        options=("Todo", "In progress 🏗", "Done"),
+        aggregates={"total": 40, "no_status": 0, "draft": 0, "redacted": 0, "open": 30, "closed": 10},
+        status_counts=(9, 21, 10),
+    )
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        filtered = await client.post(
+            "/v1/connectors/github/projects/1/read",
+            headers=_auth_header(),
+            json={"owner": "openteams-ai", "query": 'status:"In Progress"'},
+        )
+        unfiltered = await client.post(
+            "/v1/connectors/github/projects/1/read", headers=_auth_header(), json={"owner": "openteams-ai"}
+        )
+    body = filtered.json()
+    assert body["matched_count"] == 0 and body["total_count"] == 40
+    assert body["note"] == (
+        "The filter matched 0 of the board's 40 items (counts stay board-wide). "
+        "status: values must match a column name exactly, including any emoji. "
+        'Columns here: "Todo", "In progress 🏗", "Done".'
+    )
+    assert unfiltered.json()["note"] == ""
+
+
+async def test_github_read_project_no_note_when_filter_matches(tmp_path, monkeypatch):
+    _install_mock_client(monkeypatch, _counts_handler(read_node=_board_node(board_total=2), aggregates={"total": 2}))
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(
+            "/v1/connectors/github/projects/1/read",
+            headers=_auth_header(),
+            json={"owner": "openteams-ai", "query": "is:open"},
+        )
+    body = response.json()
+    assert body["matched_count"] == 2 and body["note"] == ""
+
+
+async def test_github_read_project_no_note_on_empty_board(tmp_path, monkeypatch):
+    # Zero matches on a board with zero items is just an empty board.
+    node = _board_node(board_total=0, nodes=[])
+    _install_mock_client(monkeypatch, _counts_handler(read_node=node, aggregates={"total": 0}))
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(
+            "/v1/connectors/github/projects/1/read",
+            headers=_auth_header(),
+            json={"owner": "openteams-ai", "query": "is:open"},
+        )
+    body = response.json()
+    assert body["matched_count"] == 0 and body["total_count"] == 0 and body["note"] == ""
 
 
 async def test_github_read_project_unfiltered_matched_equals_total(tmp_path, monkeypatch):
