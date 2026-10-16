@@ -108,32 +108,6 @@ query ProjectRead($login: String!, $number: Int!, $first: Int!, $after: String, 
 }}
 """
 
-# Counting-only enumeration for the sampled-counts fallback: just what
-# _sampled_counts buckets on (type, linked state, Status column), none of the
-# title/repo/assignee/label payload. Same node shape as the read, so
-# _project_item parses it; fieldValues keeps the single-select fragment only,
-# which preserves the read's case-insensitive "status" field matching.
-_PROJECT_COUNT_SAMPLE_BODY = """projectV2(number: $number) {
-      items(first: $first, after: $after) {
-        totalCount
-        pageInfo { hasNextPage endCursor }
-        nodes {
-          type
-          content { __typename ... on Issue { state } ... on PullRequest { state } }
-          fieldValues(first: 8) {
-            nodes { ... on ProjectV2ItemFieldSingleSelectValue { name field { ... on ProjectV2FieldCommon { name } } } }
-          }
-        }
-      }
-    }"""
-
-_PROJECT_COUNT_SAMPLE_QUERY = f"""
-query ProjectCountSample($login: String!, $number: Int!, $first: Int!, $after: String) {{
-  organization(login: $login) {{ {_PROJECT_COUNT_SAMPLE_BODY} }}
-  user(login: $login) {{ {_PROJECT_COUNT_SAMPLE_BODY} }}
-}}
-"""
-
 # Project reads auto-paginate server-side: GitHub's GraphQL caps a page at 100,
 # so we walk up to _MAX_PROJECT_PAGES pages and set truncated=True when the
 # matching items exceed what we returned. The default request asks for far
@@ -215,7 +189,7 @@ _API_GET_OWNER_SCOPED_COLLECTIONS = ("repos", "orgs", "users")
 _COUNTS_ARCHIVED = "archivedStates: [NOT_ARCHIVED]"
 # A1: options + total + by-type + by-state + blank-status, all in one request.
 # The by_type/by_state aliases lean on the `query` filter DSL, so a rejection of
-# that DSL surfaces here and drops the whole count path to the sampled fallback.
+# that DSL surfaces here and drops the whole count path (counts come back null).
 # `is:draft` matches BOTH board drafts (DraftIssue) and draft PRs, and a board
 # draft ALSO matches `is:issue` -- so the type partition is built from the raw
 # buckets, not by summing overlapping filters (see _authoritative_counts):
@@ -306,17 +280,15 @@ class GitHubProjectRead:
     """One board read. project.items_count is always the whole board size;
     matched is how many items the request filter selected (== items_count
     with no filter); items is the page(s) actually returned, at most max_items.
-    counts is filled by read_project_with_counts and is board-wide."""
+    counts is filled by read_project_with_counts and is board-wide; None when
+    the server-side count queries failed (the read itself still succeeded)."""
 
     project: GitHubProject
     items: list[GitHubProjectItem]
     matched: int
-    # Cursor after the last returned item (None once the listing is exhausted),
-    # so the counts fallback can continue the enumeration instead of restarting.
+    # Continuation cursor after the last returned item (None once the listing
+    # is exhausted), bound to (owner, number, query) -- see _wrap_project_cursor.
     cursor: str | None = None
-    # True when items are the board's first items, unfiltered: the only case in
-    # which they can stand in for (the head of) the whole board.
-    from_start: bool = True
     counts: GitHubProjectCounts | None = None
 
     @property
@@ -367,6 +339,11 @@ class GitHubUpstreamError(RuntimeError):
 
 class GitHubSearchError(ValueError):
     """Caller-correctable search parameters (e.g. a stale page_token) -> 422."""
+
+
+class GitHubProjectReadError(ValueError):
+    """Caller-correctable project read parameters (an `after` cursor issued for
+    a different owner, project or query) -> 422."""
 
 
 class GitHubApiRequestError(ValueError):
@@ -620,12 +597,21 @@ class GitHubClient:
         """Read a board's items, auto-paginating server-side up to a bounded cap
         (GitHub caps a GraphQL page at 100). With a query, only matching items
         are walked; with `after` (a previous read's next cursor) the walk
-        continues from there. See GitHubProjectRead for what the totals mean."""
+        continues from there. See GitHubProjectRead for what the totals mean.
+
+        `after` must have been issued by a read with the same owner, number
+        and query: a GitHub items cursor is opaque and position-based, so one
+        taken under a different filter would silently land on the wrong page.
+        The cursor we hand out is therefore fingerprinted (see
+        _wrap_project_cursor) and a mismatch raises GitHubProjectReadError."""
+        login = owner.strip()
+        query = query.strip()
+        fingerprint = _project_cursor_fingerprint(login=login, number=number, query=query)
         walk = await self._walk_project_items(
             _PROJECT_READ_QUERY,
-            {"login": owner.strip(), "number": number, "query": query.strip() or None},
+            {"login": login, "number": number, "query": query or None},
             cap=max_items,
-            after=after or None,
+            after=_unwrap_project_cursor(after, fingerprint),
             operation="project read",
             not_found_status=404,
         )
@@ -633,8 +619,7 @@ class GitHubClient:
             project=_project(walk.project),
             items=walk.items,
             matched=_total_count(walk.project, "items"),
-            cursor=walk.cursor,
-            from_start=not after and not query.strip(),
+            cursor=_wrap_project_cursor(walk.cursor, fingerprint),
         )
 
     async def _walk_project_items(
@@ -675,10 +660,10 @@ class GitHubClient:
     ) -> GitHubProjectRead:
         """read_project plus board-wide aggregate counts, computed concurrently.
 
-        Counts never break the read: on any count failure we fall back to
-        bucketing an unfiltered enumeration, flagged non-authoritative when that
-        enumeration doesn't cover the whole board. A read_project failure
-        propagates after the counts task is cancelled so it can't leak."""
+        Counts never break the read: on any count failure the read still
+        returns with counts=None, and total_count / matched_count / truncated
+        remain exact without them. A read_project failure propagates after the
+        counts task is cancelled so it can't leak."""
         login = owner.strip()
         counts_task = asyncio.ensure_future(self._authoritative_counts(login=login, number=number))
         try:
@@ -690,77 +675,19 @@ class GitHubClient:
             raise
         try:
             read.counts = await counts_task
-        except Exception as exc:
+        except Exception:
             # Expected degrade (upstream/network, rejected filter DSL, non-reconciling
-            # self-check) samples at WARNING. Anything else is a coding bug (bad query
+            # self-check) logs at WARNING. Anything else is a coding bug (bad query
             # edit, upstream shape change, TypeError in parsing) that would otherwise
             # become permanent silent degradation, so keep its own ERROR event.
-            # Either way the read still returns, with sampled counts.
+            # Either way the read still returns, with counts=None.
+            exc = counts_task.exception()
             if isinstance(exc, (GitHubUpstreamError, httpx.HTTPError)):
-                logger.warning("github_project_counts_fallback", exc_info=True)
+                logger.warning("github_project_counts_unavailable", exc_info=exc)
             else:
-                logger.error("github_project_counts_unexpected_error", exc_info=True)
-            read.counts = await self._fallback_counts(login=login, number=number, read=read, failure=exc)
+                logger.error("github_project_counts_unexpected_error", exc_info=exc)
+            read.counts = None
         return read
-
-    async def _fallback_counts(
-        self, *, login: str, number: int, read: GitHubProjectRead, failure: BaseException
-    ) -> GitHubProjectCounts:
-        """Sample counts when the server-side count queries are unavailable.
-
-        Reuses the returned items when they already are the whole board.
-        Otherwise it continues the enumeration with the slim counting-only
-        query (type / state / Status, no titles, assignees or labels): a read
-        from the top of the board resumes from its own cursor so the items
-        already in hand are counted, not re-fetched; a filtered read, or one
-        that started from an `after` cursor, can't stand in for the board, so
-        the sample starts over. Up to the 500 ceiling either way.
-
-        No extra requests are made when the count queries failed for a reason
-        the walk would share -- GitHub is rate limiting (REST or GraphQL
-        shape), answered 5xx, or the connection timed out -- so a read that
-        degrades never stacks more round-trips on a throttled or failing
-        upstream. Then the from-the-top items are bucketed as a sample and any
-        other read reports zero buckets against the real board total.
-
-        Never raises: the walk is a best effort on top of an already
-        successful read, so any failure in it, expected or not, degrades to
-        the sample in hand."""
-        board_total = read.project.items_count
-
-        def partial(items: list[GitHubProjectItem]) -> GitHubProjectCounts:
-            # What we can honestly say without more data. _sampled_counts keeps
-            # total = the board size and the four by_type / two by_state keys
-            # present (zeroed when `items` is empty), and flags the result
-            # non-authoritative unless the sample covers the whole board.
-            return _sampled_counts(total=board_total, items=items)
-
-        head = list(read.items) if read.from_start else []
-        if read.from_start and (len(head) >= board_total or read.cursor is None):
-            return partial(head)  # already complete (or GitHub has no further page)
-        if len(head) >= _MAX_PROJECT_ITEMS:
-            return partial(head)  # at the ceiling already; one more page can't help
-        if _skip_count_sample(failure):
-            logger.info("github_project_counts_sample_skipped", extra={"reason": type(failure).__name__})
-            return partial(head)
-        try:
-            walk = await self._walk_project_items(
-                _PROJECT_COUNT_SAMPLE_QUERY,
-                {"login": login, "number": number},
-                cap=_MAX_PROJECT_ITEMS - len(head),
-                after=read.cursor if read.from_start else None,
-                operation="project count sample",
-                not_found_status=None,
-            )
-        except (GitHubUpstreamError, httpx.HTTPError):
-            logger.warning("github_project_counts_sample_failed", exc_info=True)
-            return partial(head)
-        except Exception:
-            # An unexpected shape in the sample walk must not turn a successful
-            # item read into a 500; log loud, keep the read.
-            logger.error("github_project_counts_sample_unexpected_error", exc_info=True)
-            return partial(head)
-        return _sampled_counts(total=_total_count(walk.project, "items") or board_total, items=head + walk.items)
 
     async def _authoritative_counts(self, *, login: str, number: int) -> GitHubProjectCounts:
         data = await self._graphql(
@@ -771,7 +698,7 @@ class GitHubClient:
         # this specific query (rate limit, transient upstream issue, ...), not
         # evidence the project doesn't exist -- no status_code, matching the
         # "invalid response" convention for an unexpected shape (vs. a real HTTP
-        # error). project_counts turns this into the sampled fallback.
+        # error). read_project_with_counts turns this into counts=None.
         project = _owner_project(
             data, operation="project counts", status_code=None, message="project data missing from response"
         )
@@ -798,13 +725,13 @@ class GitHubClient:
         options = [o for o in options if o]
         by_status = await self._status_column_counts(login=login, number=number, options=options)
         no_status = _tc("no_status")
-        # Verify the invariant before advertising authoritative=True. Two disclosed
+        # Verify the invariant before reporting the counts. Two disclosed
         # edges can silently miscount while the query still "succeeds": a Status
         # option whose name contains `"` (see _project_filter_value), and a board
         # whose single-select isn't named "Status" (statusField -> null, so
         # by_status is empty while no:status counts something unrelated). If the
-        # buckets don't reconcile to the total, refuse the authoritative stamp --
-        # raise so project_counts degrades to the honest sampled fallback.
+        # buckets don't reconcile to the total, refuse to report them -- raise so
+        # read_project_with_counts returns counts=None rather than wrong numbers.
         if sum(c.count for c in by_status) + no_status != total or issue < 0 or redacted < 0:
             raise GitHubUpstreamError(
                 operation="project counts",
@@ -823,8 +750,6 @@ class GitHubClient:
                 "redacted": redacted,
             },
             by_state={"open": _tc("opened"), "closed": _tc("closed")},
-            authoritative=True,
-            counted_items=total,
         )
 
     async def _status_column_counts(
@@ -1430,6 +1355,38 @@ def _decode_page_token(page_token: str, fingerprint: str) -> int:
     return page
 
 
+# A project items cursor is opaque and position-based, and GitHub does not
+# reject one that was issued under a different `query` -- it just serves that
+# position of the new listing. Bind the cursor we return to the parameters
+# that produced it, the same way search page_token is bound, so a reuse under
+# other parameters is a 422 instead of a silently wrong page.
+_PROJECT_CURSOR_SEP = "."
+
+
+def _project_cursor_fingerprint(*, login: str, number: int, query: str) -> str:
+    raw = f"{login.lower()}\x1f{number}\x1f{query}".encode()
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+
+def _wrap_project_cursor(cursor: str | None, fingerprint: str) -> str | None:
+    if cursor is None:
+        return None
+    return f"{fingerprint}{_PROJECT_CURSOR_SEP}{cursor}"
+
+
+def _unwrap_project_cursor(after: str | None, fingerprint: str) -> str | None:
+    if not after:
+        return None
+    token_fingerprint, sep, cursor = after.partition(_PROJECT_CURSOR_SEP)
+    if not sep or not cursor:
+        raise GitHubProjectReadError("after is malformed; use next_cursor from a previous response")
+    if token_fingerprint != fingerprint:
+        raise GitHubProjectReadError(
+            "after does not match the current owner, project number and query; restart without it"
+        )
+    return cursor
+
+
 def _repo_from_repository_url(repository_url: str) -> str:
     marker = "/repos/"
     index = repository_url.find(marker)
@@ -1519,64 +1476,6 @@ def _project_item(node: dict) -> GitHubProjectItem:
         assignees=_logins((content.get("assignees") or {}).get("nodes")),
         labels=_label_names((content.get("labels") or {}).get("nodes")),
         fields=fields,
-    )
-
-
-_PROJECT_TYPE_BUCKETS = {
-    "ISSUE": "issue",
-    "PULL_REQUEST": "pull_request",
-    "DRAFT_ISSUE": "draft",
-    "REDACTED": "redacted",
-}
-
-
-def _skip_count_sample(failure: BaseException) -> bool:
-    """True when the count queries failed for a reason a counting walk would
-    share: GitHub is rate limiting, answered 5xx, or the transport failed
-    (timeout, connection error). Walking then adds load exactly when it hurts
-    and can stack several client timeouts onto an already-returned read."""
-    if isinstance(failure, GitHubUpstreamError):
-        return failure.transient
-    return isinstance(failure, httpx.HTTPError)
-
-
-def _sampled_counts(*, total: int, items: list[GitHubProjectItem]) -> GitHubProjectCounts:
-    """Bucket the already-enumerated items when server-side counts are
-    unavailable. Exact only when the whole board was enumerated
-    (counted == total); otherwise flagged non-authoritative so a caller never
-    reads a truncated sample as a full count."""
-    by_status: dict[str, int] = {}
-    order: list[str] = []
-    no_status = 0
-    by_type = {"issue": 0, "pull_request": 0, "draft": 0, "redacted": 0}
-    by_state = {"open": 0, "closed": 0}
-    for item in items:
-        bucket = _PROJECT_TYPE_BUCKETS.get(item.type)
-        if bucket:
-            by_type[bucket] += 1
-        if item.status:
-            if item.status not in by_status:
-                by_status[item.status] = 0
-                order.append(item.status)
-            by_status[item.status] += 1
-        else:
-            no_status += 1
-        if item.state == "merged":
-            # A merged PR is closed; the authoritative path counts it under
-            # is:closed, so sample the same way rather than dropping it.
-            by_state["closed"] += 1
-        elif item.state in ("open", "closed"):
-            by_state[item.state] += 1
-    counted = len(items)
-    return GitHubProjectCounts(
-        total=total,
-        archived_policy="excluded",
-        by_status=[GitHubStatusCount(name=name, count=by_status[name]) for name in order],
-        no_status=no_status,
-        by_type=by_type,
-        by_state=by_state,
-        authoritative=counted == total,
-        counted_items=counted,
     )
 
 

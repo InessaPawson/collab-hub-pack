@@ -589,10 +589,8 @@ class GitHubProjectCounts(BaseModel):
     # default that matches the live board a human sees).
     total: int = 0
     archived_policy: str = "excluded"
-    # Per Status-column counts; no_status is the blank column. When authoritative,
-    # columns are in board-column order and by_status + no_status reconcile to
-    # total. On the sampled fallback the buckets cover only counted_items, in
-    # first-seen order (zero-count columns omitted).
+    # Per Status-column counts; no_status is the blank column. Columns are in
+    # board-column order and by_status + no_status reconcile to total.
     by_status: list[GitHubStatusCount] = Field(default_factory=list)
     no_status: int = 0
     # Two independent partitions of total — do NOT cross-add. by_type keys:
@@ -601,11 +599,6 @@ class GitHubProjectCounts(BaseModel):
     # not sum to total (drafts/redacted have no state).
     by_type: dict[str, int] = Field(default_factory=dict)
     by_state: dict[str, int] = Field(default_factory=dict)
-    # True when produced by server-side count queries, OR when the whole board
-    # was enumerated (counted_items == total) so the buckets are exact. False
-    # marks a truncated sample: breakdowns cover only counted_items.
-    authoritative: bool = False
-    counted_items: int = 0
 
 
 class GitHubProjectsListRequest(BaseModel):
@@ -625,9 +618,10 @@ class GitHubProjectReadRequest(BaseModel):
     # e.g. 'status:"In Progress"' or 'assignee:octocat') that narrows the items
     # returned; `counts` and `total_count` stay board-wide either way and the
     # response echoes the filter as `query` with its `matched_count`.
-    # `after` continues a listing from a previous response's `next_cursor` (same
-    # owner, number and query), so items 51-100 cost one more page rather than
-    # a re-download of the first 50 under a larger max_items.
+    # `after` continues a listing from a previous response's `next_cursor`, so
+    # items 51-100 cost one more page rather than a re-download of the first 50
+    # under a larger max_items. The cursor is bound to the (owner, number,
+    # query) that issued it; reusing it with any of those changed is a 422.
     owner: str = Field(min_length=1, max_length=100)
     max_items: int = Field(default=50, ge=1, le=500)
     query: str = Field(default="", max_length=256)
@@ -650,18 +644,15 @@ class GitHubProjectReadResponse(UntrustedConnectorResponse):
     matched_count: int = 0
     truncated: bool = False
     # Opaque cursor after the last item returned; null once the listing is
-    # exhausted. Feed it back as `after` to page without re-reading.
+    # exhausted. Feed it back as `after` (same owner, number and query) to page
+    # without re-reading.
     next_cursor: str | None = None
-    # Set only when `query` matched nothing on a non-empty board. GitHub answers
-    # a mistyped or emoji-mismatched filter (e.g. status:"In Progress" on a
-    # board whose column is 'In progress 🏗') with zero items and no error, and
-    # in evals the model then read counts.by_status as the filter's result.
-    # The note says the filter matched 0 and lists the board's real Status
-    # column names so the caller can retry with one of them.
-    note: str = ""
     # Board-wide aggregate breakdowns (per status column, by type, open/closed),
-    # independent of max_items and query: computed by server-side count queries
-    # when available, otherwise sampled and flagged non-authoritative.
+    # independent of max_items and query, from exact server-side count queries.
+    # Null when those queries failed; total_count / matched_count / truncated
+    # above are still exact. (A filter that matched nothing shows as
+    # matched_count=0 against a non-zero total_count, not as an empty board;
+    # the real Status column names are in counts.by_status.)
     counts: GitHubProjectCounts | None = None
 
 

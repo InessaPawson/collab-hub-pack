@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import math
 import re
@@ -19,7 +18,7 @@ from collab_hub_api.connectors.drive_client import DriveUpstreamError, GoogleDri
 from collab_hub_api.connectors.github_client import (
     GitHubApiRequestError,
     GitHubClient,
-    GitHubProjectRead,
+    GitHubProjectReadError,
     GitHubSearchError,
     GitHubUpstreamError,
 )
@@ -772,6 +771,8 @@ async def read_github_project(
         read = await client.read_project_with_counts(
             owner=body.owner, number=number, max_items=body.max_items, query=body.query, after=body.after
         )
+    except GitHubProjectReadError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
     except GitHubUpstreamError as exc:
         logger.info(
             "github_project_read_upstream_error",
@@ -783,34 +784,18 @@ async def read_github_project(
     # total_count stays the board size (same scalar as project.items_count and
     # counts.total); matched_count is what the query selected and drives
     # truncated, so a filter that matched nothing on a non-empty board reads as
-    # matched_count=0 < total_count rather than as an empty board.
-    query = body.query.strip()
+    # matched_count=0 < total_count rather than as an empty board. The API
+    # stays data-only: what that reading means is the tool description's job.
     return GitHubProjectReadResponse(
         project=read.project,
         items=read.items,
-        query=query,
+        query=body.query.strip(),
         total_count=read.project.items_count,
         matched_count=read.matched,
         truncated=read.truncated,
         next_cursor=read.cursor,
         counts=read.counts,
-        note=_github_empty_filter_note(query=query, read=read),
     )
-
-
-def _github_empty_filter_note(*, query: str, read: GitHubProjectRead) -> str:
-    """Explain a filter that selected nothing on a non-empty board, naming the
-    real Status columns (already sanitized by the client) so the caller can
-    tell a mistyped or emoji-mismatched filter from an empty result, and does
-    not read counts.by_status as what the filter matched."""
-    if not query or read.matched or not read.project.items_count:
-        return ""
-    note = f"The filter matched 0 of the board's {read.project.items_count} items (counts stay board-wide)."
-    columns = [c.name for c in read.counts.by_status] if read.counts else []
-    if columns:
-        names = ", ".join(json.dumps(name, ensure_ascii=False) for name in columns)
-        note += f" status: values must match a column name exactly, including any emoji. Columns here: {names}."
-    return note
 
 
 @router.get("/notion/status", response_model=NotionStatus)
