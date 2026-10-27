@@ -255,6 +255,18 @@ def kind(r: Rendered, name: str) -> dict | None:
     return next((d for d in r.docs if d.get("kind") == name), None)
 
 
+def case_publish_with_indexer(r: Rendered) -> None:
+    # Who may publish (issue #180) governs push requests, which reach the API
+    # replicas only: they carry it, the indexer carries none of it.
+    publish = {n: r.value(n) for n in r.env if n.startswith("COLLAB_HUB_API__COGS__PUBLISH__")}
+    assert publish == {
+        "COLLAB_HUB_API__COGS__PUBLISH__ALLOWED_ROLES": '["owner"]',
+        "COLLAB_HUB_API__COGS__PUBLISH__MAX_PENDING_REPOSITORIES": "5",
+    }, publish
+    assert r.indexer is not None
+    assert not [n for n in r.indexer.env if n.startswith("COLLAB_HUB_API__COGS__PUBLISH__")], sorted(r.indexer.env)
+
+
 def case_serve_with_indexer(r: Rendered) -> None:
     # Serving and sweeping both on: /v2 routes to the API replicas only, but
     # the indexer carries the same serve settings. A sweep is held to the
@@ -383,6 +395,7 @@ def case_no_run_controller(r: Rendered) -> None:
 CASES = {
     "serve-off": case_serve_off,
     "serve-with-indexer": case_serve_with_indexer,
+    "publish-with-indexer": case_publish_with_indexer,
     "serve-nebariapp": case_serve_nebariapp,
     "serve-nebariapp-no-timeout": case_serve_nebariapp_no_timeout,
     "serve-httproute": case_serve_httproute,

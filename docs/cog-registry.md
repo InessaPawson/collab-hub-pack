@@ -4,8 +4,9 @@ The hub indexes Cogs from OCI registries. This page covers the `cogs:` block
 of the Helm chart and the matching application settings: which registries are
 read (**sources**), how the hub authenticates to them (**credentials**), how a
 private CA is trusted (**CA bundle**), how often the index is rebuilt
-(**indexer**), and whether the hub serves pulls itself
-([**pulls through the Hub**](#pulls-through-the-hub)). The adapters themselves — what "Harbor" and "static" mean and
+(**indexer**), whether the hub serves pulls itself
+([**pulls through the Hub**](#pulls-through-the-hub)), and whether it accepts
+publishes ([**publishing through the Hub**](#publishing-through-the-hub)). The adapters themselves — what "Harbor" and "static" mean and
 why the registry stays swappable — are documented in
 `api/src/collab_hub_api/cogs/registry.py`; the configuration surface is
 [#87](https://github.com/openteams-ai/collab-hub-pack/issues/87).
@@ -48,9 +49,10 @@ and the external `url`; the rest depends on the kind.
 | `tokenUrl` | all | In-cluster bearer-token endpoint for the OCI client, when the registry's `WWW-Authenticate` realm points at an external host the pod cannot reach. |
 | `projects` | harbor | Harbor projects to enumerate. At least one. |
 | `repositories` | static | OCI repository paths to index (`project/name`). |
-| `indexUrl` | static | URL of a `catalog.v1.json` listing repositories. A static source needs `repositories`, `indexUrl`, or both. |
+| `indexUrl` | static | URL of a `catalog.v1.json` listing repositories. A static source needs `repositories`, `indexUrl`, or both, unless it is the `publish` source, whose repositories are the ones published through the Hub. |
 | `caBundlePath` | all | Per-source CA bundle path inside the pod. Defaults to the shared bundle below when that is configured. |
 | `requestTimeoutSeconds` | all | HTTP timeout, default 10, at most 60. |
+| `publish` | all | `true` on exactly one source: pushes through the Hub are written to it. See [publishing](#publishing-through-the-hub). |
 | `blobRedirectHosts` | all | Hosts a blob redirect from this registry may point at (its object storage): exact names or IPv4 addresses, or leading-dot suffixes such as `.s3.amazonaws.com`. Empty means no allowlist. Setting it turns the [redirect rules](#redirects) on for this source. |
 | `credentials` | all | Where the robot/service credential lives — see the next section. Omit for anonymous access. |
 | `webhook` | harbor | Where the shared webhook secret lives. A static source has no webhook and the render refuses the block. |
@@ -439,7 +441,7 @@ oras pull hub.example.com/cogs/cog-audio-transcriber@sha256:…
 | `GET`/`HEAD /v2/<name>/blobs/<digest>` | The blob, streamed. `HEAD` answers the size from the manifest that references it. |
 | `GET /v2/<name>/tags/list` | `{"name", "tags"}`, sorted. A page is at most 1000 tags (also the default without `n`); `last` continues after a tag, and a `Link: …; rel="next"` is sent while more remain. |
 | `GET /v2/token` | The distribution token endpoint. |
-| any other method under `/v2/` | 405 `UNSUPPORTED`: the surface is read-only. |
+| any other method under `/v2/` | The [push API](#publishing-through-the-hub) when a source is marked `publish`; otherwise 405 `UNSUPPORTED` ("this registry is read-only"), before authentication. Deleting a manifest or a blob is always 405. |
 
 Errors are the registry format, `{"errors": [{"code", "message", "detail"}]}`:
 `UNAUTHORIZED` (401), `DENIED` (403: the account has no organization, or a
@@ -454,7 +456,7 @@ refresh token there. It exchanges its session for a **registry credential**:
 
 | Route | Answers |
 | --- | --- |
-| `POST /v1/cogs/registry-credentials` | 201 `{"id", "registry", "username", "secret", "scope": "pull", "expires_at"}`. Optional body `{"scope": "pull"}`; any other scope is 422. |
+| `POST /v1/cogs/registry-credentials` | 201 `{"id", "registry", "username", "secret", "scope", "expires_at"}`. Optional body `{"scope": "pull"}` (the default) or, on a Hub that accepts publishes, `{"scope": "publish"}` ([publishing](#publishing-through-the-hub)); any other scope is 422, and so is `publish` on a Hub that accepts none. |
 | `DELETE /v1/cogs/registry-credentials/{id}` | 204. 404 `cog_registry_credential_not_found` for an id that is unknown, expired or someone else's. |
 | `DELETE /v1/cogs/registry-credentials` | 204: every credential and pull token of the caller. Idempotent. |
 
@@ -466,9 +468,14 @@ All three need an ordinary Hub sign-in and answer 404
   signing key to configure or rotate. `id` is one URL-safe path segment
   matching `[A-Za-z0-9][A-Za-z0-9_-]{0,127}` (today `crc-` and 24 hex
   digits), and `username` is the same string.
-- **Pull-only.** It can be turned into pull tokens and nothing else. Token
-  requests ignore `push`; a repository is granted only when its requested
-  actions include `pull`.
+- **Pull-only, unless exchanged to publish.** A `pull` credential can be
+  turned into pull tokens and nothing else: of a token request's scopes it
+  is granted the repositories it asks to `pull`, and `push` adds nothing.
+  Only a credential exchanged with `{"scope": "publish"}` mints tokens that
+  carry `push`, and then **per repository**: a token asked for with
+  `repository:a:pull,push repository:b:pull` may push to `a` and only pull
+  from `b`. On a Hub that accepts no publishes, `push` in a scope names
+  nothing at all, as before publishing existed.
 - **Short-lived.** It stops at `expires_at` (`credentialTtlSeconds`, fifteen
   minutes by default), and so does every token minted from it, whatever
   `tokenTtlSeconds` says. Exchange a fresh one before each install, and size
@@ -698,12 +705,26 @@ absent for everyone else, and `source_id` names the source for any
 authenticated caller.
 
 Logs are the operator's, and may name a backing host; they must not carry a
-credential. The Hub's own lines name the source id. The HTTP libraries'
+credential. The rule for the HTTP client's own request lines is the same
+everywhere, publishing included: a **read** from a registry (indexing,
+serving a pull, and in a publish the bundle validation and the check that a
+repository is new) is logged with the backing URL, without its query string
+or userinfo; a **write** is logged with the operation and the source id and
+no URL at all. The Hub's own lines name the source id. The HTTP libraries'
 lines are filtered: the request log (`httpx`, INFO) loses URL query strings
 and userinfo, so a pre-signed storage URL is not logged with its signature,
 and the transport trace (`httpcore`, DEBUG) loses every header value, so
 neither a redirect's `Location` nor a `Set-Cookie` or `WWW-Authenticate` is
-logged. These two filters are **process-wide**: they are installed when a
+logged. A **write** to a registry (publishing) is logged without its URL
+altogether: the URL is an upload session's, at the backing registry, and its
+path can be the capability to write to that session, so the line carries the
+operation and the source id instead
+(`HTTP Request: PATCH [registry write: upload chunk, source main] "HTTP/1.1 202 Accepted"`).
+What that protects is the session URL. The backing registry's **host name**
+is configuration, not a secret, and still appears in logs an operator reads:
+in read lines as above, and at DEBUG in the transport's connection trace
+(`connect_tcp`, TLS `server_hostname`) for reads and writes alike.
+These two filters are **process-wide**: they are installed when a
 deployment turns on `cogs.serve.enabled` and then apply to every HTTP client
 in the process, not only the registry's. With serving off, logging is
 exactly what it was. That includes a deployment that only indexes: its
@@ -764,11 +785,330 @@ same host as the API:
 
 ### Trying it
 
-`scripts/cog-serve-e2e/run.sh distribution` (or `zot`) starts a private
-registry, publishes a Cog to it, starts the Hub in front of it as a `static`
-source, and pulls the Cog from the Hub with `oras` over TLS. CI runs both
+`scripts/cog-serve-e2e/run.sh distribution` (or `zot`) publishes a Cog
+through the Hub into a private registry and pulls it back from the Hub with
+`oras` over TLS; see [publishing](#trying-it-1). CI runs both
 (`.github/workflows/test-cog-serve-e2e.yaml`); the same script against two
 registries is the check that the registry behind the Hub is swappable.
+
+## Publishing through the Hub
+
+Off by default. Marking one source `publish: true` makes the Hub accept
+pushes on the same `/v2/` surface it serves pulls on, and write them through
+to that source. A publisher needs a Hub sign-in and the publish permission,
+and no account on the backing registry:
+
+```yaml
+cogs:
+  registry:
+    sources:
+      - id: main
+        kind: static                 # any kind; harbor works the same way
+        url: https://registry.example.com
+        publish: true                # exactly one source
+        credentials:
+          existingSecret: collab-hub-registry-robot   # must be able to push
+  serve:
+    enabled: true                    # publishing needs the /v2 surface
+  publish:
+    allowedRoles: []                 # operator | owner | member
+    allowedUsers: []                 # Hub user ids
+    maxPendingRepositories: 20       # unsettled names one organization may hold
+```
+
+`publish: true` on more than one source, or without `cogs.serve.enabled`, is
+refused at render and at startup. The publish source may be a `static`
+source with neither `repositories` nor `indexUrl`: the repositories
+published through the Hub are recorded, and the indexer enumerates them
+along with whatever the source lists itself, so any OCI registry can be the
+publish target with no repository list to maintain.
+
+Standard clients work unchanged against the Hub host with a publish
+credential: `oras push`, `nebi publish`, and a Nebi server's publish.
+
+### Who may publish
+
+**The publish permission.** Nobody holds it by default, and being able to
+pull never implies it. An operator grants it in `cogs.publish`:
+
+- `allowedRoles` grants it by role: `operator` (the platform role), `owner`
+  and `member` (the caller's role in their organization). To let every
+  organization owner publish, set `allowedRoles: [owner]`; to make one
+  person a publisher, make them an owner of their organization, or list
+  them in `allowedUsers`. Roles exist only where the Hub resolves
+  organizations from membership.
+- `allowedUsers` grants it to named Hub user ids (the ACL principal, the
+  `sub` on a deployment that pins identity to it), whatever their role. Under
+  claims-sourced auth there are no roles, and this is the only way.
+
+Changing either is a values change and a rollout.
+
+**Repository ownership.** A repository belongs to the organization that
+first publishes to it through the Hub, and **is never reassigned to another
+organization automatically**. The Hub writes the repository's row before it
+forwards the first manifest: *pending*, and already owned by the publisher's
+organization. What the registry answers decides what becomes of it:
+
+- **accepted**: the row is committed. The repository is that organization's.
+- **definitely refused** (a 4xx other than 408, including a 429, or the
+  registry refusing the Hub's own credential): nothing was stored. The
+  pending row is deleted once every manifest that organization had in flight
+  for the name has been refused, and the name is free again. The row holds
+  each attempt by its id, so a publish cut off by its deadline while the
+  name was being reserved waits for the reservation to finish and takes back
+  exactly its own hold.
+- **unknown** (a timeout, a 408 or a 5xx, a failure to record the outcome): the
+  registry may hold the manifest, so the row stays, pending and owned, for
+  as long as it takes. No other organization can publish to the name, or
+  open an upload in it, including a platform operator; the same organization
+  can simply publish again, which settles it.
+
+A pending repository is not ownership a sweep relies on at once: two minutes
+after it was written, sweeps start looking there. What they find is listed
+either way, and the row is committed **only if a digest found there is one
+the registry is known to have accepted from that organization for that
+repository**. That is the recovery path for a publish whose acceptance was
+recorded and whose commit was not: it settles at the next sweep. Nothing
+else found there proves whose the name is, and that includes a digest the
+organization merely attempted: the attempt may have stored nothing, and the
+same bytes can be pushed by anyone. So when acceptance itself was never
+recorded, or the content was pushed to the registry some other way, it is
+listed as out-of-band content with no publisher, the row stays pending, the
+Hub logs
+`cog_publish_pending_repository_holds_other_content`, and from then on only
+a platform operator may publish there, until an operator sorts it out
+(release the name, below, or publish). If the registry has no such
+repository, that is an empty answer, not an error, and the row stays
+pending. An upload alone never creates a row.
+
+One organization may hold at most `cogs.publish.maxPendingRepositories`
+(20 by default) pending names at once. Nothing pending expires, so this is
+what bounds the names a publisher can leave behind while the registry is
+failing; past it, a manifest for one more new name is refused with 429
+`TOOMANYREQUESTS` before anything is forwarded. Publishing again to a name
+that is already pending is never refused by it, and settling or releasing
+one makes room. Of two organizations
+publishing a new name at once, one holds it and the other's manifest is
+refused before anything is written.
+
+A name that is stuck pending, with nothing in the registry and nobody coming
+back for it, is released by a platform operator with database access. There
+is deliberately no API for it:
+
+```sql
+-- what is pending, whose, and since when
+SELECT repository, owner_org_id, created_by, created_at
+FROM collab_cog_repositories WHERE NOT committed;
+
+-- release one name, after checking the registry holds nothing under it
+DELETE FROM collab_cog_repositories WHERE repository = 'cogs/example' AND NOT committed;
+```
+
+After that a push to the repository needs the publish
+permission *and* membership of the owning organization. Platform operators
+are excepted from the ownership rule, not from the permission.
+
+**A repository that was not published through the Hub** accepts pushes from
+platform operators only. That is decided from the registry as well as the
+catalog: before anything of a publisher's reaches a name nobody owns yet --
+an upload being opened, a check for a blob already there, a manifest, which
+is checked before its bundle is read back for validation -- the Hub asks the
+publish source whether the repository already holds a tag (one request), so
+a repository pushed to the registry directly is protected even before any
+sweep has indexed it. A blob check there answers "not here". Only an answer that says so counts as
+"nothing there": a missing repository, or a tag list for that repository
+that is explicitly empty. If the registry cannot answer, or answers with
+anything else (no `tags` field, another repository's name, not JSON), the
+publish is refused with 503 and nothing is reserved or forwarded. So one
+organization cannot overwrite another organization's Cog, or a tag of it,
+nor content nobody published through the Hub.
+
+**Checked on every request.** The permission, the caller's current
+organization and roles, and the repository's ownership are checked on every
+push request, before anything is sent to the registry: a role withdrawn or a
+member removed a moment ago is refused on the next chunk. On a
+membership-resolving deployment these are read from the Hub's tables each
+time. Under claims-sourced auth the organization is the one the Hub session
+named when the credential was exchanged, and the credential's lifetime is
+the bound.
+
+### What a client does
+
+```
+POST /v1/cogs/registry-credentials {"scope":"publish"}   201 {id, registry, username, secret, scope:"publish", expires_at}
+GET  /v2/token?service=<hub>&scope=repository:<name>:pull,push   (Basic username:secret)   200 {token, ...}
+POST  /v2/<name>/blobs/uploads/                    202  Location: /v2/<name>/blobs/uploads/<id>
+PATCH /v2/<name>/blobs/uploads/<id>                202  Range: 0-<n>
+PUT   /v2/<name>/blobs/uploads/<id>?digest=sha256:…  201  Location: /v2/<name>/blobs/sha256:…
+PUT   /v2/<name>/manifests/<tag|digest>            201  Docker-Content-Digest: sha256:…
+```
+
+The exchange answers 403 `cog_publish_forbidden` when the caller does not
+hold the permission. When no source is marked `publish`, `publish` is not a
+scope at all: the exchange answers the same 422 `validation_error` it
+answers for any unknown scope, exactly as before publishing existed. A publish credential has the same lifetime, revocation
+and storage as a pull credential, and may also pull.
+
+| Route | Answers |
+| --- | --- |
+| `POST /v2/<name>/blobs/uploads/` | 202 with the upload's `Location`, `Range: 0-0` and `Docker-Upload-UUID`. With `?digest=` and a body, the whole blob in one request: 201. A cross-repository mount request (`?mount=&from=`) is answered as an ordinary upload; nothing is mounted. |
+| `PATCH /v2/<name>/blobs/uploads/<id>` | The next chunk, streamed: 202 with the new `Range`. A `Content-Range` is optional and checked in full: one that does not start where the upload left off is 416 with the `Range` it is at; one that is malformed, ends before it starts, or is not as long as the body is 400. |
+| `PUT /v2/<name>/blobs/uploads/<id>?digest=…` | Closes the upload, optionally with the last (or only) bytes: 201. A `Content-Range` on it is checked the same way. |
+| `GET /v2/<name>/blobs/uploads/<id>` | 204 with `Range`: where the upload is. |
+| `DELETE /v2/<name>/blobs/uploads/<id>` | Cancels the upload: 204. |
+| `HEAD /v2/<name>/blobs/<digest>` | For a caller who may push to `<name>`: 200 if the publish source already holds the blob there, so a client can skip an upload. It makes nothing pullable. |
+| `PUT /v2/<name>/manifests/<reference>` | Validates, commits and indexes the manifest: 201. |
+| `DELETE` of a manifest or a blob | 405 `UNSUPPORTED`. Nothing is deleted through the Hub. |
+
+Push errors, in the registry format: `UNAUTHORIZED` (401, with a challenge
+whose scope is `repository:<name>:pull,push`), `DENIED` (403: no publish
+permission, another organization's repository, settled or still pending, or
+a token that does not carry `push` for this repository),
+`BLOB_UPLOAD_UNKNOWN` (404: no such upload, or one that ended after a write
+whose outcome was unknown; start the blob again), `BLOB_UPLOAD_INVALID` (400: a `Content-Range`
+that does not fit, or **another request is writing to this upload: retry**;
+416 for a chunk out of order), `DIGEST_INVALID` (400: the registry found the
+bytes do not hash to the digest), `SIZE_INVALID` (413: over `maxBlobBytes`, or
+over the publish registry's own limit), `MANIFEST_INVALID` (400, or 413 for a
+manifest over 5 MiB), `TOOMANYREQUESTS` (429: too many uploads open or still
+being cleaned up, or the organization already has `maxPendingRepositories`
+names pending), `UNSUPPORTED` (405), `UNAVAILABLE` (503, including when the
+publish registry answers 429 or 408: try again; after a 429 the upload is
+where it was).
+
+One answer is neither a success nor a refusal: **the registry accepted the
+manifest and the catalog does not list it**. It is 503 `UNAVAILABLE` when the
+catalog write could not be made (put the manifest again, or wait for a
+sweep), and 500 `UNKNOWN` when the catalog refused the row itself; in both
+the message says the manifest is stored. It is never reported as a 201.
+
+### What happens to a push
+
+**Uploads are sessions the Hub owns.** The client sees only the Hub's own
+upload id and paths. The backing registry's session URL stays in the
+database (`collab_cog_upload_sessions`, migration 14), so any replica can
+continue an upload, and no `Location`, `Range` or `Docker-Upload-UUID` a
+client sees is the registry's. A session belongs to the user who opened it
+and to one repository, expires after an hour with no chunk recorded (each
+one renews it, and a single write may run for as long as `maxBlobSeconds`
+allows), and a user holds at most 64.
+Bytes are streamed to the registry as they arrive, counted against
+`maxBlobBytes`, and never buffered; the registry verifies each blob against
+its digest when the upload is closed. Writes go to the registry's own origin
+only: an upload location on another origin is refused and a write is never
+redirected.
+
+The Hub's record and the registry's session are kept in step. The Hub takes
+its slot *before* it asks the registry to open a session, so the cap holds
+before anything exists upstream, and the slot stays its opener's until the
+registry's session is attached: neither the cap nor the cleanup touches a
+slot that is still opening. A session the Hub lets go of (past the cap,
+expired, cancelled, or dead, below) is cancelled at the registry *before*
+its record is deleted, a few per request; a record whose cancellation failed
+is kept and tried again, for at most a day, and a user whose slots are all
+waiting to be cleaned up is answered 429. A registry session the Hub has no
+slot for and could not cancel is recorded all the same, so its location is
+not lost.
+
+**One request at a time writes to a session.** A `PATCH`, the closing `PUT`
+and a `DELETE` each take the session's lease (a compare-and-set on its row,
+so it holds across replicas, and no database connection is held while bytes
+move). A second write while it is held is refused with
+`BLOB_UPLOAD_INVALID` and told to retry, so two requests cannot both add to
+the same byte count and pass `maxBlobBytes` between them. The lease is given
+back only when the Hub knows what the registry took: after a write it
+recorded, or after a definite refusal. **After any write whose outcome is
+unknown** (a timeout, a lost response, a 5xx, a failure to record the
+result) **the upload is over**: the Hub's byte count can no longer be
+trusted, so the session is cancelled at the registry and every later request
+for it is `BLOB_UPLOAD_UNKNOWN` (404). The client starts the blob again. A
+lease is never taken over by another request; if the Hub cannot even record
+that a session is dead, the lease running out says so.
+
+**A manifest is validated before it is committed.** The layers were just
+uploaded, so at manifest `PUT` the Hub reads the bundle with the catalog's
+own reader, through the indexer's code path, before forwarding anything. A
+bundle the catalog would not list is refused with `MANIFEST_INVALID` and the
+reader's errors, one per entry: not a Cog, no id, a reader error such as bad
+frontmatter or a missing manifest file, a layer that was never uploaded.
+Nothing is written to the registry, nothing is listed and no repository is
+claimed. A multi-platform index is refused: a Cog bundle is a single
+manifest. If the registry cannot be read while validating, the answer is 503,
+not a verdict on the bundle.
+
+**An accepted manifest is indexed in the request.** Once the registry has
+the manifest, the row the validation produced is stored through the
+indexer's lock-less targeted path, so `GET /v1/cogs` lists the version
+immediately, and the manifest's blobs are pullable through the Hub at once.
+The authenticated publisher is recorded on the row as `published_by` (the
+Hub user id) and `published_org`. These are separate from the card's
+`publisher`, which stays whatever the bundle declares about itself. They
+appear on catalog entries only on a Hub that accepts publishes, are omitted
+for anonymous callers, and are null for a version pushed to the registry
+directly. A later sweep reconciles the row like any other (tags moved at the
+registry, removal) and leaves the publisher as recorded.
+
+The row and its tag are one transaction, under the request's deadline. **A
+tag put through the Hub is on exactly one digest** of its source and
+repository: putting a manifest under a tag another digest holds moves the
+tag, and putting a manifest by digest adds no tag and brings none back. If
+that transaction fails, the answer says the manifest is stored and not
+listed (above). A manifest with no tag stays listed on any kind of source: a
+`static` source finds manifests through their tags and so cannot list one
+with none, and a sweep asks the registry about each such row instead (one
+`HEAD`), removing it only when the registry no longer has it.
+
+**Who published a digest is only ever taken from an attempt the registry is
+known to have accepted.** Each manifest `PUT` is recorded as an attempt of
+its own (`collab_cog_publication_attempts`) before it is forwarded, and
+marked accepted only after the registry has accepted that attempt's
+manifest. Whichever write then lists the digest (the request itself, a
+retried push, a later sweep) takes the publisher from the earliest accepted
+attempt, and a publisher that is on a row stays there. An attempt that was
+refused is deleted by its own request and no other; one whose outcome was
+never known attributes nothing, to anyone, and is purged after a day. The
+consequence is stated plainly: **if the registry accepted a manifest and the
+Hub could not record that it had, the publisher of that digest is unknown**
+(`published_by` is null, as for a version pushed to the registry directly)
+until somebody publishes it through the Hub again. The Hub does not guess.
+
+A sweep that is running while a publish lands does not undo it: its removal
+step only touches rows last written before it began enumerating, so a
+version published (or published again after having been removed) since then
+is left for the next sweep to judge. The sweep's writes and the publish
+write take their database locks in the same order.
+
+**Deadlines and limits** are those of pulls: one aggregate deadline per
+request (`maxBlobSeconds` for a request that carries a blob, thirty seconds
+otherwise), store calls bounded by the request budget in the database, and
+`maxBlobBytes` per blob.
+
+### Rollout
+
+1. **Give the Hub's registry credential push** on the publish source's
+   project or namespace. The Hub writes with the same credential it reads
+   with (`credentials.existingSecret` on that source); there is no second
+   credential block. Until it can push, publishes answer 503 and the Hub
+   logs `cog_publish_upstream_failed` with `OCIAuthError`.
+2. Mark the source `publish: true`, with serving enabled, and name who may
+   publish in `cogs.publish`. Chart and values land together, as always.
+3. **Stop granting people membership of the registry project for
+   publishing**, and remove what was granted: publishers need a Hub account
+   with the publish permission, nothing else. Repositories that already
+   exist in the registry were not published through the Hub, so they accept
+   pushes from platform operators only; republish them under a new name, or
+   have an operator publish the next version.
+
+### Trying it
+
+`scripts/cog-serve-e2e/run.sh distribution` (or `zot`) starts the Hub with a
+private registry as its publish source and no repository list, publishes a
+Cog to the Hub with `oras`, and pulls it back. CI runs both registries.
+`scripts/cog-serve-e2e/conformance.sh` runs the OCI distribution-spec
+conformance suite's pull and push workflows against the Hub. The suite's
+fixtures are not Cog bundles, so it starts the Hub through a test-only
+launcher that replaces the validation step in its own process; no setting
+does that.
 
 ## How the rules stay in step
 

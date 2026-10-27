@@ -845,6 +845,128 @@ COLLAB_SCHEMA_MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             """,
         ),
     ),
+    (
+        14,
+        (
+            # Publishing through the Hub (issue #180): pushes arrive on the
+            # Hub's /v2/ surface and are written through to one source.
+            #
+            # The organization a registry credential's owner acted in when it
+            # was exchanged. On a membership-resolving deployment the owner's
+            # organization is re-read on every push; this is what a publish
+            # is attributed to where there is no membership table to re-read.
+            "ALTER TABLE collab_cog_registry_credentials ADD COLUMN IF NOT EXISTS org_id text",
+            # Which of a token's repositories it may push to. Per repository,
+            # never per token: asking to push to one repository and pull from
+            # another yields exactly that. Empty for every token that is not
+            # minted from a publish credential. This, not version 13's
+            # `actions` column (which stays 'pull' on every row), is what
+            # decides a push.
+            """
+            ALTER TABLE collab_cog_registry_tokens
+            ADD COLUMN IF NOT EXISTS push_repositories text[] NOT NULL DEFAULT '{}'
+            """,
+            # Who published an artifact *through the Hub*: the authenticated
+            # Hub user and their organization, as opposed to the `publisher`
+            # the bundle declares about itself. NULL for anything the indexer
+            # found that was pushed to the registry directly. Not in the
+            # indexer's upsert column list, so a sweep that rewrites the row
+            # leaves both as they are.
+            "ALTER TABLE collab_cog_artifacts ADD COLUMN IF NOT EXISTS published_by text",
+            "ALTER TABLE collab_cog_artifacts ADD COLUMN IF NOT EXISTS published_org text",
+            # A repository first published through the Hub belongs to the
+            # publisher's organization: later pushes need membership of it.
+            # One row per repository path, written *before* the first
+            # manifest is forwarded to the registry: pending (`committed`
+            # false) and already owned by the publisher's organization, then
+            # committed once the registry has accepted a manifest. A pending
+            # row is deleted only when the registry has definitely refused
+            # every attempt that organization had in flight (`holders` names
+            # them, by attempt id, so a request that cannot tell whether its
+            # own reservation landed can still take back exactly its own);
+            # an unknown outcome leaves it pending and owned, so a
+            # name is never handed to another organization automatically. A
+            # platform operator releases a stuck one by hand (see
+            # docs/cog-registry.md). Committed rows, and pending rows past a
+            # grace period, extend their source's enumeration. `owner_org_id`
+            # is NULL when a platform operator with no organization
+            # published it.
+            """
+            CREATE TABLE IF NOT EXISTS collab_cog_repositories (
+                repository   text PRIMARY KEY,
+                source_id    text NOT NULL,
+                owner_org_id text,
+                created_by   text NOT NULL,
+                committed    boolean NOT NULL DEFAULT false,
+                holders      text[] NOT NULL DEFAULT '{}',
+                created_at   timestamptz NOT NULL DEFAULT now()
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS collab_cog_repositories_source_idx
+            ON collab_cog_repositories (source_id)
+            """,
+            # Who published a digest through the Hub, one row per attempt.
+            # Written before the manifest is forwarded; `accepted_at` is set
+            # only once the registry has accepted that attempt's manifest,
+            # and only an accepted attempt ever attributes a catalog row --
+            # the earliest, when there are several. An attempt that was
+            # refused is deleted by its own request; one that never resolved
+            # attributes nothing and is purged by age. Accepted attempts are
+            # kept: they are the record of who published what. If acceptance
+            # could not be recorded, the digest's publisher stays unknown.
+            """
+            CREATE TABLE IF NOT EXISTS collab_cog_publication_attempts (
+                attempt_id    text PRIMARY KEY,
+                source_id     text NOT NULL,
+                repository    text NOT NULL,
+                digest        text NOT NULL,
+                published_by  text NOT NULL,
+                published_org text,
+                created_at    timestamptz NOT NULL DEFAULT now(),
+                accepted_at   timestamptz
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS collab_cog_publication_attempts_digest_idx
+            ON collab_cog_publication_attempts (source_id, repository, digest)
+            """,
+            # An upload in progress. The client only ever sees `id`; the
+            # backing registry's own session URL stays here, so any replica
+            # can continue an upload and no response names the backing host.
+            # The row is written *before* the registry is asked to open its
+            # session (`upstream_location` NULL until it has), held by its
+            # opener's lease. `received` is the number of bytes forwarded so
+            # far. `leased_until` is the mutation lease: one request at a
+            # time, across replicas, may forward bytes to (or close, or
+            # cancel) a session, and it gives the lease back only once the
+            # outcome is recorded -- a lease that has run out marks a session
+            # nobody can account for, which is dead. A dead or expired row is
+            # kept until its registry session has been cancelled, or a day
+            # has passed.
+            """
+            CREATE TABLE IF NOT EXISTS collab_cog_upload_sessions (
+                id                text PRIMARY KEY,
+                user_id           text NOT NULL,
+                repository        text NOT NULL,
+                source_id         text NOT NULL,
+                upstream_location text,
+                received          bigint NOT NULL DEFAULT 0 CHECK (received >= 0),
+                leased_until      timestamptz,
+                created_at        timestamptz NOT NULL DEFAULT now(),
+                expires_at        timestamptz NOT NULL
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS collab_cog_upload_sessions_expiry_idx
+            ON collab_cog_upload_sessions (expires_at)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS collab_cog_upload_sessions_user_idx
+            ON collab_cog_upload_sessions (user_id)
+            """,
+        ),
+    ),
 )
 
 

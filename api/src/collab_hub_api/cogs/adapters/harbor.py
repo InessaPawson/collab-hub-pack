@@ -36,6 +36,7 @@ from ..registry import (
     CogRegistrySourceConfig,
     OCIClientFactory,
     RegistryEvent,
+    RegistryRepositoryNotFound,
     RegistrySourceAuthError,
     RegistrySourceError,
     RegistrySourceProtocolError,
@@ -81,6 +82,9 @@ _LINK_NEXT = re.compile(r'<[^>]*>\s*;\s*rel="?next"?', re.IGNORECASE)
 class HarborRegistrySource:
     """See the module docstring. Constructed by ``build_registry_sources``."""
 
+    lists_untagged = True
+    """Harbor's artifact API lists untagged artifacts too."""
+
     def __init__(
         self,
         config: CogRegistrySourceConfig,
@@ -120,6 +124,7 @@ class HarborRegistrySource:
             transport=http_transport,
             redirect_hosts=tuple(config.blob_redirect_hosts),
             restrict_redirects=restrict_redirects,
+            name=config.id,
         )
         self._closed = False
 
@@ -246,7 +251,8 @@ class HarborRegistrySource:
                 f"source {self.id!r}: the registry API refused the configured credential for {path} (HTTP {status})"
             )
         if status == 404:
-            raise RegistrySourceError(f"source {self.id!r}: {path} does not exist on the registry (HTTP 404)")
+            kind = RegistryRepositoryNotFound if path.endswith("/artifacts") else RegistrySourceError
+            raise kind(f"source {self.id!r}: {path} does not exist on the registry (HTTP 404)")
         raise RegistrySourceProtocolError(f"source {self.id!r}: {path} answered HTTP {status}")
 
     # -- webhooks --------------------------------------------------------------

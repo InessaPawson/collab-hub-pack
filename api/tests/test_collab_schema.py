@@ -50,6 +50,9 @@ COLLAB_TABLES = (
     "collab_cog_registry_tokens",
     "collab_cog_registry_credentials",
     "collab_cog_manifest_blobs",
+    "collab_cog_repositories",
+    "collab_cog_publication_attempts",
+    "collab_cog_upload_sessions",
     "collab_cog_artifacts",
     "collab_service_access_grants",
     "collab_provisioned_accounts",
@@ -397,7 +400,58 @@ def test_migration_creates_the_cog_registry_credential_schema():
     )
     assert "collab_cog_registry" not in earlier and "collab_cog_artifacts_repository_idx" not in earlier
     assert "collab_cog_manifest_blobs" not in earlier
-    assert LATEST_COLLAB_SCHEMA_VERSION == 13
+
+
+def test_migration_creates_the_cog_publishing_schema():
+    server = FakeServer()
+
+    run_collab_schema_migrations(FakeDatabase(server))
+
+    created = " ".join(server.statements)
+    # Additive on the two existing tables: nothing a version-13 database holds is rewritten.
+    for statement in (
+        "ALTER TABLE collab_cog_registry_credentials ADD COLUMN IF NOT EXISTS org_id text",
+        "ALTER TABLE collab_cog_artifacts ADD COLUMN IF NOT EXISTS published_by text",
+        "ALTER TABLE collab_cog_artifacts ADD COLUMN IF NOT EXISTS published_org text",
+        "ALTER TABLE collab_cog_registry_tokens"
+        " ADD COLUMN IF NOT EXISTS push_repositories text[] NOT NULL DEFAULT '{}'",
+        "CREATE INDEX IF NOT EXISTS collab_cog_repositories_source_idx ON collab_cog_repositories (source_id)",
+        "CREATE INDEX IF NOT EXISTS collab_cog_publication_attempts_digest_idx"
+        " ON collab_cog_publication_attempts (source_id, repository, digest)",
+        "CREATE INDEX IF NOT EXISTS collab_cog_upload_sessions_expiry_idx ON collab_cog_upload_sessions (expires_at)",
+        "CREATE INDEX IF NOT EXISTS collab_cog_upload_sessions_user_idx ON collab_cog_upload_sessions (user_id)",
+    ):
+        assert statement in created, statement
+    (repositories,) = server.ddl_for("collab_cog_repositories")
+    # One owner per repository path, whatever source it was written through.
+    assert "repository text PRIMARY KEY" in repositories and "owner_org_id text," in repositories
+    assert "created_by text NOT NULL" in repositories and "source_id text NOT NULL" in repositories
+    # A row is pending until the registry accepts a manifest, and it never expires: no column says when.
+    assert "committed boolean NOT NULL DEFAULT false" in repositories
+    assert "holders text[] NOT NULL DEFAULT '{}'" in repositories and "until" not in repositories
+    (attempts,) = server.ddl_for("collab_cog_publication_attempts")
+    # One row per attempt, and accepted only when it says so.
+    assert "attempt_id text PRIMARY KEY" in attempts and "published_by text NOT NULL" in attempts
+    assert "accepted_at timestamptz" in attempts and "accepted_at timestamptz NOT NULL" not in attempts
+    (uploads,) = server.ddl_for("collab_cog_upload_sessions")
+    # The slot exists before the registry's session does, so the location starts out unknown.
+    assert "id text PRIMARY KEY" in uploads and "upstream_location text," in uploads
+    assert "received bigint NOT NULL DEFAULT 0 CHECK (received >= 0)" in uploads
+    assert "leased_until timestamptz," in uploads and "expires_at timestamptz NOT NULL" in uploads
+    # Appended as version 14; nothing earlier mentions any of it.
+    earlier = " ".join(
+        statement for version, statements in COLLAB_SCHEMA_MIGRATIONS if version < 14 for statement in statements
+    )
+    for name in (
+        "collab_cog_repositories",
+        "collab_cog_publication_attempts",
+        "collab_cog_upload_sessions",
+        "published_by",
+        "push_repositories",
+        "org_id text",
+    ):
+        assert name not in earlier, name
+    assert LATEST_COLLAB_SCHEMA_VERSION == 14
 
 
 def test_rerunning_the_migration_applies_nothing():
@@ -443,6 +497,7 @@ PINNED_CHECKSUMS = {
     11: "4269a363932920da48b77be6cb6b02fe7ab933b4ab0478f0a722bb08244adbb1",
     12: "b4d98654df15a5f52a16273f77cae95daa5d597aa1f7ff1e78b830ce9cc2cabd",
     13: "0fdba92b5b894fa4358da5ebada5a33ce23a527e181dce411268df650a71935d",
+    14: "c3ceed5775cd624aabf1b9b9ac90aa23f8909cf93777f90836c7a263f72a2494",
 }
 
 

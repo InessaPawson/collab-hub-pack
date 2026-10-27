@@ -289,6 +289,7 @@ toJson sorts keys, so the rendering is deterministic.
 {{- with .repositories }}{{ $_ := set $source "repositories" . }}{{ end -}}
 {{- with .indexUrl }}{{ $_ := set $source "index_url" . }}{{ end -}}
 {{- with (default $caBundlePath .caBundlePath) }}{{ $_ := set $source "ca_bundle_path" . }}{{ end -}}
+{{- if .publish }}{{ $_ := set $source "publish" true }}{{ end -}}
 {{- with .blobRedirectHosts }}{{ $_ := set $source "blob_redirect_hosts" . }}{{ end -}}
 {{- if hasKey . "requestTimeoutSeconds" }}{{ $_ := set $source "request_timeout_seconds" .requestTimeoutSeconds }}{{ end -}}
 {{- $credentials := .credentials | default dict -}}
@@ -695,6 +696,25 @@ clients are held to the same redirect policy as the ones that serve pulls. */}}
   value: {{ .Values.cogs.serve.maxBlobBytes | int64 | quote }}
 - name: COLLAB_HUB_API__COGS__SERVE__MAX_BLOB_SECONDS
   value: {{ .Values.cogs.serve.maxBlobSeconds | int64 | quote }}
+{{- end }}
+{{- /* Who may publish through the Hub (issue #180). Rendered only when
+someone is named: the default, nobody, needs no variable. API replicas only:
+pushes are requests, and the indexer takes none. (Unlike serving, which the
+indexer carries too: a publish source needs it, and a sweep reads it.) */}}
+{{- if not $indexer }}
+{{- with .Values.cogs.publish.allowedRoles }}
+- name: COLLAB_HUB_API__COGS__PUBLISH__ALLOWED_ROLES
+  value: {{ toJson . | quote }}
+{{- end }}
+{{- with .Values.cogs.publish.allowedUsers }}
+- name: COLLAB_HUB_API__COGS__PUBLISH__ALLOWED_USERS
+  value: {{ toJson . | quote }}
+{{- end }}
+{{- /* Rendered only when it is not the API's own default. */}}
+{{- if ne (.Values.cogs.publish.maxPendingRepositories | int64) 20 }}
+- name: COLLAB_HUB_API__COGS__PUBLISH__MAX_PENDING_REPOSITORIES
+  value: {{ .Values.cogs.publish.maxPendingRepositories | int64 | quote }}
+{{- end }}
 {{- end }}
 {{- if .Values.cogs.registry.sources }}
 - name: COLLAB_HUB_API__COGS__REGISTRY_SOURCES

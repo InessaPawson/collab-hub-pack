@@ -55,6 +55,9 @@ source's removal step skipped and says which repository is out of shape.
 class StaticRegistrySource:
     """See the module docstring. Constructed by ``build_registry_sources``."""
 
+    lists_untagged = False
+    """Manifests are found through their tags, so one with none is never listed (see the module docstring)."""
+
     def __init__(
         self,
         config: CogRegistrySourceConfig,
@@ -81,6 +84,7 @@ class StaticRegistrySource:
             transport=http_transport,
             redirect_hosts=tuple(config.blob_redirect_hosts),
             restrict_redirects=restrict_redirects,
+            name=config.id,
         )
         # The index is fetched anonymously: it may live anywhere, and the
         # registry credential must not be presented to an arbitrary URL.

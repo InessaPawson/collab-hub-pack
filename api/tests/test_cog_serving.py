@@ -59,8 +59,9 @@ UPSTREAM_USER = "robot$hub"
 UPSTREAM_PASSWORD = "upstream-robot-password-9f3"
 UPSTREAM_TOKEN = "upstream-bearer-token-71c"
 STORAGE_SIGNATURE = "presigned-signature-4be"
+UPLOAD_STATE = "upstream-upload-state-5d2"
 
-SECRETS = (UPSTREAM_PASSWORD, UPSTREAM_TOKEN, STORAGE_SIGNATURE)
+SECRETS = (UPSTREAM_PASSWORD, UPSTREAM_TOKEN, STORAGE_SIGNATURE, UPLOAD_STATE)
 """Nothing here may appear in a response or in a log line."""
 BACKING_NAMES = (BACKING_HOST, STORAGE_HOST)
 """Nothing here may appear in a response to a client."""
@@ -123,6 +124,12 @@ class FakeRegistry:
         self.blob_delay = 0.0
         self.stream_delay = 0.0
         self.storage_scheme = "https"
+        # The push half: upload sessions by id, and switches for the failures a registry can answer with.
+        self.uploads: dict[str, bytearray] = {}
+        self.opened = 0
+        self.upload_delay = 0.0
+        self.upload_gate: asyncio.Event | None = None
+        self.refuse_writes: httpx.Response | None = None
         self.storage_saw_authorization = False
 
     def publish(self, repo: str, bundle: Bundle, *tags: str) -> None:
@@ -135,6 +142,72 @@ class FakeRegistry:
         for ref in (digest, *tags):
             self.manifests[(repo, ref)] = (media_type, body)
         return digest
+
+    def writes(self) -> list[str]:
+        """``METHOD path`` of every write the registry was sent with its credential (the 401 dance excluded)."""
+
+        return [
+            f"{request.method} {request.url.path}"
+            for request in self.requests
+            if request.method in ("POST", "PATCH", "PUT", "DELETE")
+            and request.headers.get("authorization") == f"Bearer {UPSTREAM_TOKEN}"
+        ]
+
+    async def _write(self, request: httpx.Request, rest: str) -> httpx.Response:
+        """The push half of the distribution API, as a registry answers it (absolute, stateful upload URLs)."""
+
+        if request.method == "HEAD" and "/manifests/" in rest:
+            repo, _, ref = rest.rpartition("/manifests/")
+            return httpx.Response(200 if (repo, ref) in self.manifests else 404)
+        if request.method == "HEAD":
+            digest = rest.rpartition("/blobs/")[2]
+            if digest in self.blobs:
+                return httpx.Response(200, headers={"Content-Length": str(len(self.blobs[digest]))})
+            return httpx.Response(404)
+        if self.refuse_writes is not None:
+            return self.refuse_writes
+        body = await request.aread()
+        if "/blobs/uploads" in rest:
+            repo, _, upload = rest.partition("/blobs/uploads")
+            upload = upload.strip("/")
+            location = f"{BACKING_URL}/v2/{repo}/blobs/uploads/{{}}?_state={UPLOAD_STATE}"
+            if request.method == "POST":
+                self.opened += 1
+                upload = f"upstream-{self.opened}"
+                self.uploads[upload] = bytearray()
+                return httpx.Response(202, headers={"Location": location.format(upload), "Range": "0-0"})
+            if upload not in self.uploads or request.url.params.get("_state") != UPLOAD_STATE:
+                return httpx.Response(404, text=f"{BACKING_HOST}: unknown upload")
+            received = self.uploads[upload]
+            if request.method == "GET":
+                return httpx.Response(204, headers={"Location": location.format(upload)})
+            if request.method == "DELETE":
+                del self.uploads[upload]
+                return httpx.Response(204)
+            if self.upload_delay:
+                await asyncio.sleep(self.upload_delay)
+            if self.upload_gate is not None:
+                # Held at the registry until the test lets it through.
+                await self.upload_gate.wait()
+            content_range = request.headers.get("content-range")
+            if content_range is not None and int(content_range.split("-")[0]) != len(received):
+                return httpx.Response(416, text=f"{BACKING_HOST}: out of order")
+            received.extend(body)
+            if request.method == "PATCH":
+                return httpx.Response(202, headers={"Location": location.format(upload)})
+            digest = request.url.params.get("digest")
+            if sha256(bytes(received)) != digest:
+                return httpx.Response(400, text=f"digest invalid at {BACKING_HOST} for {UPSTREAM_USER}")
+            self.blobs[digest] = bytes(received)
+            del self.uploads[upload]
+            return httpx.Response(201, headers={"Location": f"{BACKING_URL}/v2/{repo}/blobs/{digest}"})
+        if request.method == "PUT" and "/manifests/" in rest:
+            repo, _, ref = rest.rpartition("/manifests/")
+            media_type = request.headers.get("content-type", MEDIA_TYPE_OCI_MANIFEST)
+            for name in {ref, sha256(body)}:
+                self.manifests[(repo, name)] = (media_type, body)
+            return httpx.Response(201, headers={"Location": f"{BACKING_URL}/v2/{repo}/manifests/{sha256(body)}"})
+        return httpx.Response(405, text=f"{BACKING_HOST}: unsupported")
 
     async def _slowly(self, body: bytes):
         for offset in range(0, len(body), 8):
@@ -179,6 +252,8 @@ class FakeRegistry:
         if path in self.fail:
             return self.fail[path]
         _v2, _, rest = path.partition("/v2/")
+        if request.method != "GET" or "/blobs/uploads/" in rest:
+            return await self._write(request, rest)
         if rest.endswith("/tags/list"):
             repo = rest[: -len("/tags/list")]
             tags = sorted(ref for (name, ref) in self.manifests if name == repo and not ref.startswith("sha256:"))
@@ -232,7 +307,9 @@ def catalog_row(repo: str, digest: str, *, tags=("latest",), source_id="backing"
     )
 
 
-def settings(tmp_path, *, serve: dict | None = None, security: dict | None = None) -> dict:
+def settings(
+    tmp_path, *, serve: dict | None = None, security: dict | None = None, publish: dict | None = None
+) -> dict:
     result: dict = {
         "storage": {"frames_path": str(tmp_path / "frames")},
         "frames": {"mcp_session_manager_enabled": False},
@@ -253,6 +330,10 @@ def settings(tmp_path, *, serve: dict | None = None, security: dict | None = Non
     }
     if security is not None:
         result["security"] = security
+    if publish is not None:
+        # Publishing on: pushes are written through to the one source, and this is who may push.
+        result["cogs"]["registry_sources"][0]["publish"] = True
+        result["cogs"]["publish"] = publish
     return result
 
 

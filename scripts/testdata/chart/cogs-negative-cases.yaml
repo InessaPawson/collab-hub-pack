@@ -339,6 +339,36 @@ cases:
       does refuse a public URL that disagrees with web.public_base_url, the
       one other statement of its own origin, which api/tests covers.
 
+  - name: two publish sources
+    layers: [template]
+    values:
+      cogs:
+        registry:
+          sources:
+            - {id: one, kind: static, url: https://one.example.com, publish: true}
+            - {id: two, kind: static, url: https://two.example.com, publish: true}
+        serve: {enabled: true, publicUrl: https://hub.example.com}
+    chart_error: 'marks 2 sources publish: true \(one, two\)'
+    settings:
+      registry_sources:
+        - {id: one, kind: static, url: https://one.example.com, publish: true}
+        - {id: two, kind: static, url: https://two.example.com, publish: true}
+      serve: {enabled: true, public_url: https://hub.example.com}
+    app_error: 'marks 2 sources publish: true \(one, two\)'
+
+  - name: publish source without serving
+    layers: [template]
+    values:
+      cogs:
+        registry:
+          sources:
+            - {id: public, kind: static, url: https://registry.example.com, publish: true}
+    chart_error: 'source public is publish: true but cogs.serve.enabled is false'
+    settings:
+      registry_sources:
+        - {id: public, kind: static, url: https://registry.example.com, publish: true}
+    app_error: "source 'public' is publish: true but cogs.serve.enabled is false"
+
   # --- structure and grammar: schema, mirrored by the API's own validators -------
 
   - name: unknown serve key
@@ -452,6 +482,77 @@ cases:
       registry_sources:
         - {id: public, kind: static, url: https://registry.example.com, repositories: [cogs/alpha], blob_redirect_hosts: [storage.example.com, storage.example.com]}
     app_error: 'blob_redirect_hosts lists .* twice'
+
+  - name: unknown publish role
+    layers: [schema]
+    values:
+      cogs:
+        publish: {allowedRoles: [admin]}
+    chart_error: 'allowedRoles.*(enum|one of)'
+    settings:
+      publish: {allowed_roles: [admin]}
+    app_error: "Input should be 'operator', 'owner' or 'member'"
+
+  - name: blank publish user
+    layers: [schema]
+    values:
+      cogs:
+        publish: {allowedUsers: ['  ']}
+    chart_error: 'allowedUsers.*(pattern|match)'
+    settings:
+      publish: {allowed_users: ['  ']}
+    app_error: 'allowed_users entries must not be blank'
+
+  - name: a publish role listed twice
+    layers: [schema]
+    values:
+      cogs:
+        publish: {allowedRoles: [owner, owner]}
+    chart_error: 'allowedRoles.*(unique|are equal)'
+    settings:
+      publish: {allowed_roles: [owner, owner]}
+    app_error: "allowed_roles lists 'owner' twice"
+
+  - name: a publish user listed twice
+    layers: [schema]
+    values:
+      cogs:
+        publish: {allowedUsers: [8f2c1d7e-user-id, 8f2c1d7e-user-id]}
+    chart_error: 'allowedUsers.*(unique|are equal)'
+    settings:
+      publish: {allowed_users: [8f2c1d7e-user-id, 8f2c1d7e-user-id]}
+    app_error: "allowed_users lists '8f2c1d7e-user-id' twice"
+
+  - name: no room for a single pending repository
+    layers: [schema]
+    values:
+      cogs:
+        publish: {maxPendingRepositories: 0}
+    chart_error: 'maxPendingRepositories.*(minimum|greater than or equal)'
+    settings:
+      publish: {max_pending_repositories: 0}
+    app_error: 'max_pending_repositories\s+Input should be greater than or equal to 1'
+
+  - name: more pending repositories than the bound allows
+    layers: [schema]
+    values:
+      cogs:
+        publish: {maxPendingRepositories: 1001}
+    chart_error: 'maxPendingRepositories.*(maximum|less than or equal)'
+    settings:
+      publish: {max_pending_repositories: 1001}
+    app_error: 'max_pending_repositories\s+Input should be less than or equal to 1000'
+
+  - name: unknown publish key
+    layers: [schema]
+    values:
+      cogs:
+        publish: {allowedGroups: [x]}
+    chart_error: 'allowedGroups.*not allowed'
+    settings:
+      publish: {allowed_groups: [x]}
+    app_error: 'allowed_groups\s+Extra inputs are not permitted'
+    compare_render: false   # the chart renders nothing for a key it does not know
 
   - name: registry credential lifetime below the floor
     layers: [schema]
@@ -1051,6 +1152,22 @@ accepted:
     settings:
       registry_sources: []
 
+  - name: a publish source with nothing configured to enumerate, and who may publish
+    values:
+      cogs:
+        registry:
+          sources:
+            - {id: public, kind: static, url: https://registry.example.com, publish: true}
+            - {id: mirror, kind: static, url: https://mirror.example.com, repositories: [cogs/alpha]}
+        serve: {enabled: true, publicUrl: 'https://hub.example.com'}
+        publish: {allowedRoles: [owner, operator], allowedUsers: [8f2c1d7e-user-id], maxPendingRepositories: 1000}
+    settings:
+      registry_sources:
+        - {id: public, kind: static, url: https://registry.example.com, publish: true}
+        - {id: mirror, kind: static, url: https://mirror.example.com, repositories: [cogs/alpha]}
+      serve: {enabled: true, public_url: 'https://hub.example.com'}
+      publish: {allowed_roles: [owner, operator], allowed_users: [8f2c1d7e-user-id], max_pending_repositories: 1000}
+
   # The indexer Deployment's environment is the one compared (it is the
   # sweeping process): with serving on it must say so, or its sweeps follow
   # redirects outside the serving policy (docs/cog-registry.md).
@@ -1065,5 +1182,22 @@ accepted:
     settings:
       registry_sources:
         - {id: public, kind: static, url: https://registry.example.com, repositories: [cogs/alpha]}
+      serve: {enabled: true, public_url: 'https://hub.example.com'}
+      index: {enabled: true}
+
+  # And a publish source reaches the indexer (it enumerates and settles what
+  # was published through the Hub), which Config refuses without serving on.
+  # Who may publish stays on the API replicas, so it is left out here.
+  - name: a publish source with the indexer on starts the indexer
+    values:
+      cogs:
+        registry:
+          sources:
+            - {id: public, kind: static, url: https://registry.example.com, publish: true}
+        serve: {enabled: true, publicUrl: 'https://hub.example.com'}
+        index: {enabled: true}
+    settings:
+      registry_sources:
+        - {id: public, kind: static, url: https://registry.example.com, publish: true}
       serve: {enabled: true, public_url: 'https://hub.example.com'}
       index: {enabled: true}

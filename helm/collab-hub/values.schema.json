@@ -1018,6 +1018,33 @@
           },
           "additionalProperties": false
         },
+        "publish": {
+          "type": "object",
+          "properties": {
+            "allowedRoles": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "enum": ["operator", "owner", "member"]
+              }
+            },
+            "allowedUsers": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "pattern": "\\S"
+              }
+            },
+            "maxPendingRepositories": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1000
+            }
+          },
+          "additionalProperties": false
+        },
         "serve": {
           "type": "object",
           "properties": {
@@ -1393,6 +1420,9 @@
         },
         "caBundlePath": {
           "type": "string"
+        },
+        "publish": {
+          "type": "boolean"
         },
         "blobRedirectHosts": {
           "type": "array",

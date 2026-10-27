@@ -61,7 +61,8 @@ import logging
 import re
 import ssl
 import time
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import AsyncIterable, Iterable, Mapping, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -155,17 +156,32 @@ _TokenKey = tuple[str, str, str]
 """(token endpoint, service, scope): what makes one bearer token interchangeable with another."""
 
 
-class _RequestLogFilter(logging.Filter):
-    """Drop the query string and userinfo from httpx's own per-request log line.
+_registry_write: ContextVar[str | None] = ContextVar("cog_registry_write", default=None)
+"""What a write to a registry is logged as, while :meth:`OCIClient._write` sends it; ``None`` otherwise."""
 
-    httpx logs ``HTTP Request: GET <url> ...`` at INFO for every request, and
-    a blob redirect to object storage is a pre-signed URL: its query string
-    *is* the credential. The path stays (it says which blob), the rest goes.
+
+class _RequestLogFilter(logging.Filter):
+    """Keep what must not be logged out of httpx's own per-request log line.
+
+    httpx logs ``HTTP Request: GET <url> ...`` at INFO for every request.
+
+    - For a read, the query string and userinfo are dropped: a blob redirect
+      to object storage is a pre-signed URL, and its query string *is* the
+      credential. The path stays (it says which blob).
+    - For a **write** to a registry (publishing through the Hub, issue #180)
+      the URL goes altogether. It is an upload session's URL at the backing
+      registry -- its host, and a path that may itself be the capability to
+      write to that session -- so the line carries what the operation was
+      and which source it went to, and nothing the registry said.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
         if isinstance(record.args, tuple):
-            record.args = tuple(_scrubbed_url(arg) if isinstance(arg, httpx.URL) else arg for arg in record.args)
+            write = _registry_write.get()
+            record.args = tuple(
+                (write if write is not None else _scrubbed_url(arg)) if isinstance(arg, httpx.URL) else arg
+                for arg in record.args
+            )
         return True
 
 
@@ -271,6 +287,33 @@ class OCITransportError(OCIError):
     artifact as broken. The message names the httpx error class only; URLs
     and headers are never echoed.
     """
+
+
+class OCIRejected(OCIError):
+    """The registry refused a write for a reason that is the pusher's to fix (a 4xx other than 401/403/408/429).
+
+    ``status`` is the registry's status code -- 400 for a digest that does
+    not match the bytes, 404 for an upload session it no longer knows, 413
+    for a body over its own limit, 416 for a chunk out of order. The
+    registry's response body is never kept.
+    """
+
+    def __init__(self, message: str, status: int) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+class OCIThrottled(OCIError):
+    """The registry asked for the write to be tried again later: a 429, or a 408. Not the pusher's to fix.
+
+    ``status`` says which. A 429 is a refusal of the request as a whole: the
+    registry took nothing. A 408 says it stopped waiting for the request, so
+    how much of a streamed body it took is not known.
+    """
+
+    def __init__(self, message: str, status: int) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 class OCIInvalidReference(OCIProtocolError, ValueError):
@@ -383,7 +426,11 @@ class OCIClient:
         transport: httpx.AsyncBaseTransport | None = None,
         redirect_hosts: Sequence[str] = (),
         restrict_redirects: bool = False,
+        name: str | None = None,
     ) -> None:
+        # What this registry is called in logs where its URL must not appear:
+        # the configured source id.
+        self._name = name or "registry"
         try:
             origin = httpx.URL(base_url.rstrip("/"))
         except httpx.InvalidURL as exc:
@@ -509,6 +556,242 @@ class OCIClient:
         )
         return BlobStream(response, digest)
 
+    # -- writes (publishing through the Hub, issue #180) ----------------------
+    #
+    # The push half of the distribution API, with the same rules as the reads:
+    # the registry's credential is this client's alone, nothing the registry
+    # says in a body is kept, and redirects are not followed at all -- a
+    # write goes to the registry's own origin or nowhere.
+
+    async def blob_size(self, repo: str, digest: str) -> int | None:
+        """The size of a blob the repository already holds, or ``None`` if it does not (or will not say)."""
+
+        _validate_repo(repo)
+        _validate_digest(digest)
+        response = await self._exchange(
+            "HEAD", self._origin.join(f"/v2/{repo}/blobs/{digest}"), scope_hint=_pull_scope(repo), what="blob check"
+        )
+        try:
+            if response.status_code != 200:
+                return None
+            declared = response.headers.get("content-length", "")
+            return int(declared) if declared.isascii() and declared.isdigit() else None
+        finally:
+            await response.aclose()
+
+    async def has_manifest(self, repo: str, digest: str) -> bool:
+        """Whether the repository holds the manifest ``digest``: one ``HEAD``, the body never fetched.
+
+        ``False`` only for a clear 404; any other answer raises, because the
+        caller is deciding whether something is gone.
+        """
+
+        _validate_repo(repo)
+        _validate_digest(digest)
+        response = await self._exchange(
+            "HEAD",
+            self._origin.join(f"/v2/{repo}/manifests/{digest}"),
+            scope_hint=_pull_scope(repo),
+            what="manifest check",
+            headers={"Accept": MANIFEST_ACCEPT},
+        )
+        await response.aclose()
+        if response.status_code == 200:
+            return True
+        if response.status_code == 404:
+            return False
+        raise OCIProtocolError(f"manifest check: the registry answered HTTP {response.status_code}")
+
+    async def start_upload(self, repo: str) -> str:
+        """Open a blob upload session and return its URL at the registry (never to be shown to a client)."""
+
+        _validate_repo(repo)
+        url = self._origin.join(f"/v2/{repo}/blobs/uploads/")
+        response = await self._exchange("POST", url, scope_hint=_push_scope(repo), what="upload start")
+        try:
+            _expect(response, (202,), what="upload start")
+            return self._upload_location(url, response, what="upload start")
+        finally:
+            await response.aclose()
+
+    async def upload_chunk(
+        self, repo: str, location: str, content: AsyncIterable[bytes], *, offset: int, length: int | None
+    ) -> str:
+        """Send the next bytes of an upload, streamed, and return the session's (possibly new) URL."""
+
+        _validate_repo(repo)
+        url = self._session_url(location)
+        headers = {"Content-Type": "application/octet-stream"}
+        if length is not None:
+            headers["Content-Length"] = str(length)
+            if length > 0:
+                headers["Content-Range"] = f"{offset}-{offset + length - 1}"
+        await self._authorize_stream(url, _push_scope(repo))
+        response = await self._exchange(
+            "PATCH", url, scope_hint=_push_scope(repo), headers=headers, content=content, what="upload chunk"
+        )
+        try:
+            _expect(response, (202,), what="upload chunk")
+            return self._upload_location(url, response, what="upload chunk")
+        finally:
+            await response.aclose()
+
+    async def finish_upload(
+        self,
+        repo: str,
+        location: str,
+        digest: str,
+        content: AsyncIterable[bytes] | None = None,
+        *,
+        length: int | None = None,
+    ) -> None:
+        """Close an upload as ``digest``, optionally sending its last (or only) bytes. The registry verifies them."""
+
+        _validate_repo(repo)
+        _validate_digest(digest)
+        url = self._session_url(location).copy_merge_params({"digest": digest})
+        headers = {"Content-Type": "application/octet-stream"}
+        if content is None:
+            headers["Content-Length"] = "0"
+        else:
+            if length is not None:
+                headers["Content-Length"] = str(length)
+            await self._authorize_stream(url, _push_scope(repo))
+        response = await self._exchange(
+            "PUT", url, scope_hint=_push_scope(repo), headers=headers, content=content, what="upload finish"
+        )
+        try:
+            _expect(response, (201, 204), what="upload finish")
+        finally:
+            await response.aclose()
+
+    async def cancel_upload(self, repo: str, location: str) -> bool:
+        """Ask the registry to drop an upload session; never raises an :class:`OCIError`.
+
+        Returns whether the session is known to be gone: the registry
+        dropped it, or no longer knows it. ``False`` -- it could not be
+        asked, or it refused -- means the session may still be there, and
+        the caller keeps what it needs to ask again.
+        """
+
+        _validate_repo(repo)
+        try:
+            response = await self._exchange(
+                "DELETE", self._session_url(location), scope_hint=_push_scope(repo), what="upload cancel"
+            )
+        except OCIError:
+            return False
+        await response.aclose()
+        return 200 <= response.status_code < 300 or response.status_code == 404
+
+    async def put_manifest(self, repo: str, ref: str, body: bytes, media_type: str) -> None:
+        """Store a manifest under a tag or its digest."""
+
+        _validate_repo(repo)
+        _validate_ref(ref)
+        response = await self._exchange(
+            "PUT",
+            self._origin.join(f"/v2/{repo}/manifests/{ref}"),
+            scope_hint=_push_scope(repo),
+            headers={"Content-Type": media_type},
+            content=body,
+            what="manifest put",
+        )
+        try:
+            _expect(response, (201, 200, 204), what="manifest put")
+        finally:
+            await response.aclose()
+
+    def _session_url(self, location: str) -> httpx.URL:
+        url = _parse_url(location, what="upload session")
+        if not _same_origin(url, self._origin):
+            raise OCIProtocolError("upload session is not on the registry's origin")
+        return url
+
+    def _upload_location(self, url: httpx.URL, response: httpx.Response, *, what: str) -> str:
+        location = response.headers.get("location")
+        if not location:
+            raise OCIProtocolError(f"{what}: the registry named no upload location")
+        target = _join_url(url, location, what=f"{what} location")
+        if not _same_origin(target, self._origin):
+            # The registry credential is attached to every request to the
+            # session: it goes to the registry's own origin or not at all.
+            raise OCIProtocolError(f"{what}: the registry named an upload location off its own origin")
+        return str(target)
+
+    async def _authorize_stream(self, url: httpx.URL, scope_hint: str) -> None:
+        """Make sure a credential is in hand before a body that cannot be replayed is sent.
+
+        A streamed body is gone once a 401 has been answered, so the
+        challenge is taken first on a bodiless request to the same session
+        (its upload status) whenever no usable token is cached.
+        """
+
+        if self._proactive_auth(scope_hint) is not None:
+            return
+        response = await self._exchange("GET", url, scope_hint=scope_hint, what="upload status")
+        await response.aclose()
+
+    async def _exchange(
+        self,
+        method: str,
+        url: httpx.URL,
+        *,
+        scope_hint: str,
+        what: str,
+        headers: Mapping[str, str] | None = None,
+        content: bytes | AsyncIterable[bytes] | None = None,
+    ) -> httpx.Response:
+        """One non-GET request to the registry's origin, answering one 401 challenge when the body allows it.
+
+        Returns a streaming response the caller closes. A 401 after a
+        credential was presented, or to a streamed body that cannot be
+        resent, is :class:`OCIAuthError`; a 403 is too (the registry knows
+        the Hub and will not let it write). Redirects are never followed.
+        """
+
+        replayable = content is None or isinstance(content, bytes)
+        request_headers = dict(headers or {})
+        presented = self._proactive_auth(scope_hint)
+        if presented:
+            request_headers["Authorization"] = presented
+        response = await self._write(method, url, request_headers, content, what=what)
+        if response.status_code == 401 and replayable:
+            challenges = _parse_challenges(response.headers.get_list("www-authenticate"))
+            await response.aclose()
+            request_headers["Authorization"] = await self._answer_challenge(challenges, scope_hint, presented)
+            response = await self._write(method, url, request_headers, content, what=what)
+        if response.status_code in (401, 403):
+            await response.aclose()
+            raise OCIAuthError(f"{what}: the registry refused the Hub's credential")
+        if response.status_code in _REDIRECT_STATUSES:
+            await response.aclose()
+            raise OCIProtocolError(f"{what}: the registry answered a write with a redirect")
+        return response
+
+    async def _write(
+        self,
+        method: str,
+        url: httpx.URL,
+        headers: Mapping[str, str],
+        content: bytes | AsyncIterable[bytes] | None,
+        *,
+        what: str,
+    ) -> httpx.Response:
+        try:
+            request = self._http.build_request(method, url, headers=dict(headers), content=content)
+        except (UnicodeError, ValueError, TypeError) as exc:
+            raise OCIProtocolError(f"{what}: request could not be constructed: {type(exc).__name__}") from exc
+        # httpx logs the request line as the response's headers arrive, in
+        # this task: the log filter reads this instead of the URL.
+        logged = _registry_write.set(f"[registry write: {what}, source {self._name}]")
+        try:
+            return await self._http.send(request, stream=True, follow_redirects=False)
+        except httpx.HTTPError as exc:
+            raise OCITransportError(f"{what}: {type(exc).__name__}") from exc
+        finally:
+            _registry_write.reset(logged)
+
     async def list_tags(self, repo: str) -> list[str]:
         """List a repository's tags, following ``Link: rel="next"`` pagination.
 
@@ -539,6 +822,37 @@ class OCIClient:
                 return tags
             path = next_path
         raise OCIProtocolError(f"tag list did not end within {MAX_TAG_PAGES} pages")
+
+    async def has_tags(self, repo: str) -> bool:
+        """Whether the repository holds at least one tag: one request, never paged.
+
+        ``False`` for a repository the registry does not have, and for one
+        whose tag list is explicitly empty (``"tags": []`` or ``"tags":
+        null``). The answer is read **strictly**, unlike :meth:`list_tags`:
+        the caller asked a yes-or-no question whose "no" gives a name away,
+        so a document that is not the tag list of this repository -- no
+        ``tags`` field at all, one that is not a list, a ``name`` that is
+        missing or another repository's, a body that is not JSON -- raises
+        instead of being read as "nothing there".
+        """
+
+        _validate_repo(repo)
+        try:
+            response = await self._send(f"/v2/{repo}/tags/list?n=1", headers={}, scope_hint=_pull_scope(repo))
+        except OCINotFound:
+            return False
+        body = await _read_bounded(response, MAX_TAG_PAGE_BYTES, what="tag list")
+        payload = _parse_json_object(body, what="tag list")
+        if payload.get("name") != repo:
+            raise OCIProtocolError("tag list is not this repository's")
+        if "tags" not in payload:
+            raise OCIProtocolError("tag list has no 'tags' field")
+        listed = payload["tags"]
+        if listed is None:
+            return False
+        if not isinstance(listed, list):
+            raise OCIProtocolError("tag list has a malformed 'tags' field")
+        return bool(listed)
 
     # -- manifests ----------------------------------------------------------
 
@@ -1013,6 +1327,23 @@ async def fetch_bundle_files(
 
 def _pull_scope(repo: str) -> str:
     return f"repository:{repo}:pull"
+
+
+def _push_scope(repo: str) -> str:
+    return f"repository:{repo}:pull,push"
+
+
+def _expect(response: httpx.Response, statuses: tuple[int, ...], *, what: str) -> None:
+    """Raise unless the registry answered a write with one of ``statuses``. The body is not read."""
+
+    status = response.status_code
+    if status in statuses:
+        return
+    if status in (408, 429):
+        raise OCIThrottled(f"{what}: the registry answered HTTP {status}", status)
+    if 400 <= status < 500:
+        raise OCIRejected(f"{what}: the registry answered HTTP {status}", status)
+    raise OCIProtocolError(f"{what}: the registry answered HTTP {status}")
 
 
 def is_tag(value: object) -> bool:

@@ -59,6 +59,7 @@ import logging
 import re
 import time
 from collections.abc import AsyncIterator
+from contextlib import suppress
 from datetime import UTC
 
 import anyio
@@ -69,6 +70,21 @@ from starlette.concurrency import run_in_threadpool
 from ..cogs.catalog import DEFAULT_TAGS_PAGE, MAX_TAGS_PAGE, CogCatalogUnavailableError
 from ..cogs.deadline import BudgetExhausted, request_deadline
 from ..cogs.oci import OCIError
+from ..cogs.publish_store import PublishStoreUnavailableError
+from ..cogs.publishing import (
+    DigestInvalid,
+    ManifestInvalid,
+    ManifestUnlisted,
+    PublishDenied,
+    Publisher,
+    PublishError,
+    PublishLimited,
+    RepositoryInvalid,
+    UploadInvalid,
+    UploadTooLarge,
+    UploadUnknown,
+    manifest_accepted,
+)
 from ..cogs.registry import is_repository_path
 from ..cogs.registry_credentials import (
     RegistryCredentialsUnavailableError,
@@ -115,11 +131,21 @@ def registry_path(path: str) -> bool:
 class RegistryError(Exception):
     """A refusal in the OCI error format: ``{"errors": [{"code", "message", "detail"}]}``."""
 
-    def __init__(self, status_code: int, code: str, message: str, headers: dict[str, str] | None = None) -> None:
+    def __init__(
+        self,
+        status_code: int,
+        code: str,
+        message: str,
+        headers: dict[str, str] | None = None,
+        *,
+        messages: tuple[str, ...] = (),
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.code = code
         self.message = message
+        # One entry per problem, when a refusal has several (a manifest the reader rejected).
+        self.messages = messages or (message,)
         self.headers = headers or {}
 
 
@@ -135,7 +161,7 @@ class BlobStreamAborted(Exception):
 
 def error_response(exc: RegistryError) -> JSONResponse:
     return JSONResponse(
-        {"errors": [{"code": exc.code, "message": exc.message, "detail": {}}]},
+        {"errors": [{"code": exc.code, "message": message, "detail": {}} for message in exc.messages]},
         status_code=exc.status_code,
         headers={**API_VERSION_HEADERS, **exc.headers},
     )
@@ -149,21 +175,25 @@ def _quoted(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def _challenge(serving: CogRegistryServing, repository: str | None, error: str | None = None) -> dict[str, str]:
+def _challenge(
+    serving: CogRegistryServing, repository: str | None, error: str | None = None, *, push: bool = False
+) -> dict[str, str]:
     parts = [f'realm="{_quoted(serving.token_url)}"', f'service="{_quoted(serving.host)}"']
     if repository is not None and is_repository_path(repository):
-        parts.append(f'scope="repository:{repository}:pull"')
+        parts.append(f'scope="repository:{repository}:{"pull,push" if push else "pull"}"')
     if error is not None:
         parts.append(f'error="{error}"')
     return {"WWW-Authenticate": "Bearer " + ",".join(parts)}
 
 
-def _unauthorized(serving: CogRegistryServing, repository: str | None, *, insufficient: bool = False) -> RegistryError:
+def _unauthorized(
+    serving: CogRegistryServing, repository: str | None, *, insufficient: bool = False, push: bool = False
+) -> RegistryError:
     return RegistryError(
         status.HTTP_401_UNAUTHORIZED,
         "UNAUTHORIZED",
         "authentication required",
-        _challenge(serving, repository, "insufficient_scope" if insufficient else None),
+        _challenge(serving, repository, "insufficient_scope" if insufficient else None, push=push),
     )
 
 
@@ -206,6 +236,7 @@ def _storage_errors() -> tuple[type[Exception], ...]:
         RegistryCredentialsUnavailableError,
         CogCatalogUnavailableError,
         OrgsUnavailableError,
+        PublishStoreUnavailableError,
         BudgetExhausted,
         *postgres_error_classes(),
     )
@@ -261,6 +292,21 @@ async def _grant(request: Request, repository: str | None) -> TokenGrant:
 # -- the token endpoint ---------------------------------------------------------
 
 
+def _scope_entries(scopes: list[str]):
+    """``(repository, actions)`` for each well-formed ``repository:<name>:<actions>`` entry, within the input bounds."""
+
+    examined = 0
+    for scope in scopes[:MAX_SCOPE_ENTRIES]:
+        for entry in scope[:MAX_SCOPE_LENGTH].split():
+            examined += 1
+            if examined > MAX_SCOPE_ENTRIES:
+                return
+            kind, _, rest = entry.partition(":")
+            name, _, actions = rest.rpartition(":")
+            if kind == "repository" and is_repository_path(name):
+                yield name, actions.split(",")
+
+
 def requested_repositories(scopes: list[str]) -> list[str]:
     """The repositories a token request may be granted ``pull`` on.
 
@@ -271,20 +317,36 @@ def requested_repositories(scopes: list[str]) -> list[str]:
     narrows a request -- the client finds out when it uses the token.
     """
 
-    names: dict[str, None] = {}
-    examined = 0
-    for scope in scopes[:MAX_SCOPE_ENTRIES]:
-        for entry in scope[:MAX_SCOPE_LENGTH].split():
-            examined += 1
-            if examined > MAX_SCOPE_ENTRIES or len(names) >= MAX_TOKEN_SCOPES:
-                return list(names)
-            kind, _, rest = entry.partition(":")
-            name, _, actions = rest.rpartition(":")
-            if kind != "repository" or "pull" not in actions.split(","):
-                continue
-            if is_repository_path(name):
-                names.setdefault(name)
-    return list(names)
+    return requested_scope(scopes, pushing=False)[0]
+
+
+def requested_scope(scopes: list[str], *, pushing: bool = True) -> tuple[list[str], list[str]]:
+    """What a token request asks for, **per repository**: the ones to pull from, and the ones to push to.
+
+    Each entry stands for itself: ``repository:a:pull,push repository:b:pull``
+    asks to push to ``a`` and only to pull from ``b``, and no action asked of
+    one repository is ever carried over to another. Asking for ``push`` is
+    only asking: whether the token carries it is decided from the credential
+    it is minted from.
+
+    With ``pushing`` false -- a Hub that accepts no publishes -- ``push`` is
+    one more action that names nothing, exactly as before publishing existed.
+    """
+
+    pull: dict[str, None] = {}
+    push: dict[str, None] = {}
+    for name, actions in _scope_entries(scopes):
+        wants_pull = "pull" in actions
+        wants_push = pushing and "push" in actions
+        if not (wants_pull or wants_push):
+            continue
+        if name not in pull and name not in push and len(pull.keys() | push.keys()) >= MAX_TOKEN_SCOPES:
+            break
+        if wants_pull:
+            pull.setdefault(name)
+        if wants_push:
+            push.setdefault(name)
+    return list(pull), list(push)
 
 
 def _basic_credential(header: str) -> tuple[str, str] | None:
@@ -347,12 +409,20 @@ def _mint(request: Request) -> JSONResponse:
     else:
         user, credential_id = _hub_principal(request), None
     token = new_pull_token()
+    repositories, push_repositories = requested_scope(
+        request.query_params.getlist("scope"), pushing=serving.publisher is not None
+    )
     grant = serving.credentials.create_token(
         token_hash=secret_digest(token),
         user_id=user,
         credential_id=credential_id,
-        repositories=requested_repositories(request.query_params.getlist("scope")),
+        repositories=repositories,
         ttl_seconds=serving.token_ttl_seconds,
+        # Only asked for here, repository by repository. The store grants
+        # them when, and only when, the credential's scope is publish; and
+        # holding push is still not enough: every push request checks the
+        # publish permission and the repository's ownership again.
+        push_repositories=push_repositories,
     )
     if grant is None:
         # The credential was revoked or expired between the check and the mint.
@@ -472,7 +542,11 @@ async def _serve(request: Request, rest: str) -> Response:
                 await _grant(request, None)
                 raise RegistryError(status.HTTP_404_NOT_FOUND, "NAME_UNKNOWN", "repository name not known to registry")
             _kind, name, reference = parsed
-            await _grant(request, name)
+            if serving.publisher is not None and kind == "blobs" and reference.startswith("uploads/"):
+                # The status of an upload in progress: part of the push API,
+                # on a Hub that has one. Otherwise it is one more blob read.
+                return await _push(request, name, "uploads", reference[len("uploads/") :])
+            grant = await _grant(request, name)
 
             if kind == "tags":
                 return await _tags_response(request, serving, name)
@@ -488,7 +562,12 @@ async def _serve(request: Request, rest: str) -> Response:
 
             headers = {**_digest_headers(reference), "Content-Type": "application/octet-stream"}
             if head:
-                size = await serving.front.blob_size(name, reference)
+                try:
+                    size = await serving.front.blob_size(name, reference)
+                except (BlobUnknown, RepositoryUnknown):
+                    size = await _pusher_blob_size(request, grant, name, reference)
+                    if size is None:
+                        raise
                 return Response(b"", headers={**headers, "Content-Length": str(size)})
             blob = await serving.front.blob(name, reference)
     except TimeoutError:
@@ -539,6 +618,8 @@ async def _answer(request: Request, rest: str) -> Response:
     except ServeError as exc:
         status_code, code = _SERVE_ERRORS[type(exc)]
         return error_response(RegistryError(status_code, code, str(exc)))
+    except PublishError as exc:
+        return error_response(_publish_error(exc))
     except _storage_errors():
         return error_response(_unavailable())
 
@@ -560,11 +641,312 @@ async def read(request: Request, rest: str) -> Response:
     return await _answer(request, rest)
 
 
+# -- the push API (issue #180) -----------------------------------------------------
+
+MAX_MANIFEST_BYTES = 5 * 1024 * 1024
+_UPLOAD_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
+_CONTENT_RANGE = re.compile(r"(?:bytes )?([0-9]{1,19})-([0-9]{1,19})")
+_LENGTH = re.compile(r"[0-9]{1,19}")
+
+
+def _read_only() -> RegistryError:
+    """What every write is answered with by a Hub that accepts no publishes: what it was before publishing existed."""
+
+    return RegistryError(status.HTTP_405_METHOD_NOT_ALLOWED, "UNSUPPORTED", "this registry is read-only")
+
+
+def _unsupported() -> RegistryError:
+    return RegistryError(status.HTTP_405_METHOD_NOT_ALLOWED, "UNSUPPORTED", "this registry does not accept that")
+
+
+def _resolve_publisher(request: Request, grant: TokenGrant) -> Publisher:
+    """Who is pushing, as the Hub resolves them now.
+
+    On a membership-resolving deployment the organization and both roles are
+    read from the Hub's own tables on this request, so a member removed, or
+    a role withdrawn, a moment ago is already reflected. Under
+    claims-sourced auth there are no roles to read, and the organization is
+    the one the Hub session named when the credential was exchanged.
+    """
+
+    if org_source_resolves_membership():
+        try:
+            context = auth_context_from_membership(
+                {PINNED_IDENTITY_CLAIM: grant.user_id}, request.app.state.org_store
+            )
+        except NoOrganizationError:
+            raise _denied("this account is not part of an organization") from None
+        return Publisher(
+            user_id=grant.user_id,
+            org_id=context.home_org_id,
+            org_role=context.org_role,
+            platform_role=context.platform_role,
+        )
+    return Publisher(user_id=grant.user_id, org_id=grant.org_id)
+
+
+def _authorize_push(request: Request, token: str, repository: str) -> Publisher:
+    """Everything a push must pass, in one blocking hop and before any byte goes upstream.
+
+    A live token naming this repository; the push action on **this**
+    repository; the caller's current standing; the publish permission; and
+    the repository's ownership.
+    """
+
+    serving = _serving(request)
+    grant = serving.credentials.find_token(secret_digest(token)) if token else None
+    if grant is None:
+        raise _unauthorized(serving, repository, push=True)
+    if not grant.names(repository):
+        raise _unauthorized(serving, repository, insufficient=True, push=True)
+    if not grant.allows_push(repository):
+        # The token names this repository without push on it: it was asked
+        # for with pull alone here (push on another repository grants
+        # nothing here), or minted from a credential that cannot publish.
+        raise _denied(
+            "this token may not push to this repository: ask for push on it, "
+            "with a credential exchanged with the publish scope"
+        )
+    publisher = _resolve_publisher(request, grant)
+    serving.publisher.authorize(publisher, repository)
+    return publisher
+
+
+def _bearer(request: Request) -> str:
+    scheme, _, token = request.headers.get("Authorization", "").partition(" ")
+    return token.strip() if scheme.lower() == "bearer" else ""
+
+
+async def _pusher_blob_size(request: Request, grant: TokenGrant, name: str, digest: str) -> int | None:
+    """For a caller who may push to ``name``: whether the publish source already holds this blob there.
+
+    Lets a client skip an upload. Answered only after the full push
+    authorization, and only for ``HEAD``: it makes nothing pullable.
+    """
+
+    serving = _serving(request)
+    if serving.publisher is None or not grant.allows_push(name):
+        return None
+    try:
+        publisher = await run_in_threadpool(_authorize_push, request, _bearer(request), name)
+    except (RegistryError, PublishError):
+        return None
+    return await serving.publisher.blob_size(publisher, name, digest)
+
+
+def _declared_length(request: Request) -> int | None:
+    raw = request.headers.get("content-length")
+    return int(raw) if raw is not None and _LENGTH.fullmatch(raw) else None
+
+
+def _content_range(request: Request) -> tuple[int, int] | None:
+    """``(first, last)`` from ``Content-Range``, if the request carries one; malformed is refused, not ignored.
+
+    Both ends are kept: the publisher checks their order, that the range
+    starts where the upload left off, and that it is as long as the body.
+    """
+
+    raw = request.headers.get("content-range")
+    if raw is None:
+        return None
+    matched = _CONTENT_RANGE.fullmatch(raw.strip())
+    if matched is None:
+        raise RegistryError(status.HTTP_400_BAD_REQUEST, "BLOB_UPLOAD_INVALID", "the Content-Range header is malformed")
+    return int(matched.group(1)), int(matched.group(2))
+
+
+def _upload_headers(name: str, upload_id: str, received: int) -> dict[str, str]:
+    return {
+        **API_VERSION_HEADERS,
+        # The Hub's own path and id. The backing registry's session URL never leaves the database.
+        "Location": f"{REGISTRY_PATH_PREFIX}/{name}/blobs/uploads/{upload_id}",
+        "Range": f"0-{max(received - 1, 0)}",
+        "Docker-Upload-UUID": upload_id,
+        "Content-Length": "0",
+    }
+
+
+def _created(name: str, kind: str, digest: str) -> Response:
+    return Response(
+        status_code=status.HTTP_201_CREATED,
+        headers={
+            **API_VERSION_HEADERS,
+            "Location": f"{REGISTRY_PATH_PREFIX}/{name}/{kind}/{digest}",
+            "Docker-Content-Digest": digest,
+            "Content-Length": "0",
+        },
+    )
+
+
+async def _read_manifest(request: Request) -> bytes:
+    declared = _declared_length(request)
+    if declared is not None and declared > MAX_MANIFEST_BYTES:
+        raise RegistryError(status.HTTP_413_CONTENT_TOO_LARGE, "MANIFEST_INVALID", "the manifest is too large")
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        if len(body) > MAX_MANIFEST_BYTES:
+            raise RegistryError(status.HTTP_413_CONTENT_TOO_LARGE, "MANIFEST_INVALID", "the manifest is too large")
+    return bytes(body)
+
+
+async def _push(request: Request, name: str, kind: str, reference: str) -> Response:
+    """One push request, after its path has been parsed. Authorizes first, always."""
+
+    serving = _serving(request)
+    publisher_front = serving.publisher
+    method = request.method
+    publisher = await run_in_threadpool(_authorize_push, request, _bearer(request), name)
+
+    if kind == "manifests":
+        if method != "PUT":
+            raise _unsupported()
+        body = await _read_manifest(request)
+        content_type = request.headers.get("content-type", "").split(";", 1)[0].strip()
+        digest = await publisher_front.put_manifest(publisher, name, reference, body, content_type)
+        return _created(name, "manifests", digest)
+
+    # kind == "uploads"
+    length = _declared_length(request)
+    digest = request.query_params.get("digest")
+    if reference == "":
+        if method != "POST":
+            raise _unsupported()
+        # A cross-repository mount request (?mount=&from=) is answered as an
+        # ordinary upload: nothing is mounted, the client uploads the blob.
+        content_range = _content_range(request) if digest is not None else None
+        session = await publisher_front.start(publisher, name)
+        if digest is not None:
+            # The whole blob in the opening request. The client never learns
+            # this session's id, so a refusal must not leave it open.
+            try:
+                await publisher_front.finish(
+                    publisher, name, session.id, digest, request.stream(), length=length, content_range=content_range
+                )
+            except PublishError:
+                with suppress(PublishError):
+                    await publisher_front.cancel(publisher, name, session.id)
+                raise
+            return _created(name, "blobs", digest)
+        return Response(status_code=status.HTTP_202_ACCEPTED, headers=_upload_headers(name, session.id, 0))
+    if not _UPLOAD_ID.fullmatch(reference):
+        raise RegistryError(status.HTTP_404_NOT_FOUND, "BLOB_UPLOAD_UNKNOWN", "blob upload unknown to registry")
+    if method == "GET":
+        session = await publisher_front.status(publisher, name, reference)
+        return Response(
+            status_code=status.HTTP_204_NO_CONTENT, headers=_upload_headers(name, session.id, session.received)
+        )
+    if method == "PATCH":
+        session = await publisher_front.append(
+            publisher, name, reference, request.stream(), content_range=_content_range(request), length=length
+        )
+        return Response(
+            status_code=status.HTTP_202_ACCEPTED, headers=_upload_headers(name, session.id, session.received)
+        )
+    if method == "PUT":
+        if digest is None:
+            raise RegistryError(status.HTTP_400_BAD_REQUEST, "DIGEST_INVALID", "the digest parameter is required")
+        content = request.stream() if length != 0 else None
+        await publisher_front.finish(
+            publisher, name, reference, digest, content, length=length, content_range=_content_range(request)
+        )
+        return _created(name, "blobs", digest)
+    if method == "DELETE":
+        await publisher_front.cancel(publisher, name, reference)
+        return Response(status_code=status.HTTP_204_NO_CONTENT, headers=dict(API_VERSION_HEADERS))
+    raise _unsupported()
+
+
+def parse_push_path(rest: str) -> tuple[str, str, str] | None:
+    """``(kind, name, reference)`` for the paths a push may address, else ``None``.
+
+    ``<name>/blobs/uploads/`` and ``<name>/blobs/uploads/<id>`` are
+    ``("uploads", name, "" | id)``; ``<name>/manifests/<ref>`` is
+    ``("manifests", name, ref)``. A blob addressed by digest is not a push
+    path: blobs are only ever written through an upload.
+    """
+
+    for marker in ("/blobs/uploads/", "/blobs/uploads"):
+        index = rest.rfind(marker)
+        if index > 0 and (marker.endswith("/") or index + len(marker) == len(rest)):
+            reference = rest[index + len(marker) :]
+            if "/" not in reference:
+                return "uploads", rest[:index], reference
+    parsed = parse_registry_path(rest)
+    if parsed is not None and parsed[0] == "manifests":
+        return parsed
+    return None
+
+
+def _publish_error(exc: PublishError) -> RegistryError:
+    message = str(exc)
+    if isinstance(exc, PublishDenied):
+        return _denied(message)
+    if isinstance(exc, RepositoryInvalid):
+        return RegistryError(status.HTTP_400_BAD_REQUEST, "NAME_INVALID", message)
+    if isinstance(exc, UploadUnknown):
+        return RegistryError(status.HTTP_404_NOT_FOUND, "BLOB_UPLOAD_UNKNOWN", message)
+    if isinstance(exc, UploadInvalid):
+        if exc.received is not None:
+            return RegistryError(
+                status.HTTP_416_RANGE_NOT_SATISFIABLE,
+                "BLOB_UPLOAD_INVALID",
+                message,
+                {"Range": f"0-{max(exc.received - 1, 0)}"},
+            )
+        return RegistryError(status.HTTP_400_BAD_REQUEST, "BLOB_UPLOAD_INVALID", message)
+    if isinstance(exc, UploadTooLarge):
+        return RegistryError(status.HTTP_413_CONTENT_TOO_LARGE, "SIZE_INVALID", message)
+    if isinstance(exc, DigestInvalid):
+        return RegistryError(status.HTTP_400_BAD_REQUEST, "DIGEST_INVALID", message)
+    if isinstance(exc, ManifestInvalid):
+        return RegistryError(status.HTTP_400_BAD_REQUEST, "MANIFEST_INVALID", message, messages=exc.errors)
+    if isinstance(exc, PublishLimited):
+        return RegistryError(status.HTTP_429_TOO_MANY_REQUESTS, "TOOMANYREQUESTS", message)
+    if isinstance(exc, ManifestUnlisted):
+        # Not a success, and not a refusal: the registry has the manifest.
+        # The message says so, because a client told "unavailable" would
+        # assume nothing was stored.
+        if exc.retryable:
+            return RegistryError(status.HTTP_503_SERVICE_UNAVAILABLE, "UNAVAILABLE", message)
+        return RegistryError(status.HTTP_500_INTERNAL_SERVER_ERROR, "UNKNOWN", message)
+    return _unavailable()
+
+
+async def _answer_push(request: Request, rest: str) -> Response:
+    serving = _serving(request)
+    if serving.publisher is None:
+        return error_response(_read_only())
+    parsed = parse_push_path(rest)
+    if parsed is None:
+        return error_response(_unsupported())
+    kind, name, reference = parsed
+    # A request that carries a blob gets the blob budget; everything else
+    # (opening a session, a manifest and its validation) the metadata one.
+    carries_blob = kind == "uploads" and request.method in ("PATCH", "PUT", "POST")
+    budget = serving.max_blob_seconds if carries_blob else serving.max_metadata_seconds
+    _start_budget(min(budget, serving.max_metadata_seconds))
+    manifest_accepted.set(False)
+    try:
+        async with asyncio.timeout(budget):
+            return await _push(request, name, kind, reference)
+    except RegistryError as exc:
+        return error_response(exc)
+    except PublishError as exc:
+        return error_response(_publish_error(exc))
+    except TimeoutError:
+        if manifest_accepted.get():
+            # Out of time after the registry said yes: the manifest is
+            # stored, and the client must not be told that nothing happened.
+            return error_response(_publish_error(ManifestUnlisted.not_yet()))
+        return error_response(_unavailable())
+    except _storage_errors():
+        return error_response(_unavailable())
+
+
 @router.api_route(REGISTRY_PATH_PREFIX, methods=["POST", "PUT", "PATCH", "DELETE"])
 @router.api_route(REGISTRY_PATH_PREFIX + "/{rest:path}", methods=["POST", "PUT", "PATCH", "DELETE"])
-async def write(_request: Request, rest: str = "") -> Response:
-    """Pushes and deletes are not served: this surface is read-only."""
+async def write(request: Request, rest: str = "") -> Response:
+    """Pushes, when a source is marked ``publish: true``; 405 otherwise, and for every delete of content."""
 
-    return error_response(
-        RegistryError(status.HTTP_405_METHOD_NOT_ALLOWED, "UNSUPPORTED", "this registry is read-only")
-    )
+    return await _answer_push(request, rest)
