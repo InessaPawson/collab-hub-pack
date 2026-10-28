@@ -46,6 +46,7 @@ from collab_hub_api.frames.collab_schema import (  # noqa: E402
 )
 
 COLLAB_TABLES = (
+    "collab_track_runs",
     "collab_connector_state",
     "collab_cog_registry_tokens",
     "collab_cog_registry_credentials",
@@ -331,6 +332,9 @@ def test_migration_creates_the_track_schema():
     assert "schema integer NOT NULL DEFAULT 0" in events
     (payloads,) = server.ddl_for("collab_track_payloads")
     assert "ref text PRIMARY KEY" in payloads and "payload jsonb NOT NULL" in payloads
+    (runs,) = server.ddl_for("collab_track_runs")
+    assert "run_id text PRIMARY KEY" in runs and "status text NOT NULL" in runs
+    assert "retry_asked boolean NOT NULL DEFAULT false" in runs
 
     created = " ".join(server.statements)
     for statement in (
@@ -340,6 +344,9 @@ def test_migration_creates_the_track_schema():
         "CREATE UNIQUE INDEX IF NOT EXISTS collab_track_one_submission"
         " ON collab_track_events (run_id) WHERE event_type = 'op_submitted'",
         "CREATE INDEX IF NOT EXISTS collab_track_payloads_run ON collab_track_payloads (run_id)",
+        # The index of runs (migration 15): what a listing reads instead of every Track.
+        "CREATE INDEX IF NOT EXISTS collab_track_runs_org_submitted ON collab_track_runs (org_id, submitted_at)",
+        "CREATE INDEX IF NOT EXISTS collab_track_runs_status ON collab_track_runs (status)",
     ):
         assert statement in created, statement
     # Appended as version 12; nothing earlier mentions the Track.
@@ -451,7 +458,7 @@ def test_migration_creates_the_cog_publishing_schema():
         "org_id text",
     ):
         assert name not in earlier, name
-    assert LATEST_COLLAB_SCHEMA_VERSION == 14
+    assert LATEST_COLLAB_SCHEMA_VERSION == 15
 
 
 def test_rerunning_the_migration_applies_nothing():
@@ -498,6 +505,7 @@ PINNED_CHECKSUMS = {
     12: "b4d98654df15a5f52a16273f77cae95daa5d597aa1f7ff1e78b830ce9cc2cabd",
     13: "0fdba92b5b894fa4358da5ebada5a33ce23a527e181dce411268df650a71935d",
     14: "c3ceed5775cd624aabf1b9b9ac90aa23f8909cf93777f90836c7a263f72a2494",
+    15: "94c87d3dc97dfc138ea1ee78bdb067ba114163995f4ef27d44398a930690d84d",
 }
 
 
