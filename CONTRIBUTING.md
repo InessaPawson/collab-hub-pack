@@ -22,7 +22,10 @@ setup each connector needs. CI exercises all four —
 [`.github/workflows/dev-env.yaml`](.github/workflows/dev-env.yaml).
 
 The API itself lives in [`api/`](api/) and uses
-[uv](https://docs.astral.sh/uv/), if you would rather drive it directly:
+[uv](https://docs.astral.sh/uv/), if you would rather drive it directly. Use
+uv 0.13.4 or later: earlier releases still trust the compromised eMudhra CA
+chain, so upgrade with `uv self update` (standalone installer) or your package
+manager before running anything that reaches the network:
 
 ```sh
 cd api
@@ -35,8 +38,21 @@ points at a throwaway database (they drop and recreate every `collab_`
 table). CI's `test` job starts a Postgres service and sets it, so those tests
 run there.
 
+The Cog packages ([`cogs/`](cogs/), [`dev/cogs/`](dev/cogs/) and the
+[`examples/`](examples/)) are [pixi](https://pixi.sh/) projects and need pixi
+0.82.1 or later, which their manifests state with `requires-pixi`; earlier
+releases trust the same compromised CA chain. Update via `pixi self-update` or
+the package manager you installed it with.
+
+The tool versions CI installs each live in one file, so a bump is a one-line
+change: uv in [`.github/uv.toml`](.github/uv.toml), pixi in
+[`.github/pixi-version`](.github/pixi-version), and Node in the `.node-version`
+beside each package that needs it ([`api/admin-ui/`](api/admin-ui/) and
+[`scripts/release/semantic-release/`](scripts/release/semantic-release/)).
+Dependabot bumps action and image versions, not these.
+
 The admin panel is a Vite and React app in [`api/admin-ui/`](api/admin-ui/)
-with its own Vitest suite. It needs Node (CI uses Node 24):
+with its own Vitest suite. It needs Node 24.22.1 or later (CI pins 24.22.1):
 
 ```sh
 cd api/admin-ui
@@ -50,6 +66,14 @@ the version the image runs, and CI runs the suite on 3.13 as well
 (`Test (Python 3.13)`). To reproduce that job, prefix the commands with
 `UV_PYTHON=3.13`. Keep code valid on 3.13: ruff targets `py313` and reports
 newer syntax.
+
+Lint the API with the ruff version `uv.lock` pins, as the `Ruff` CI check
+does:
+
+```bash
+cd api
+uv run --only-group lint ruff check src tests
+```
 
 Running it by hand needs **all three** dev-auth switches —
 `FRAMES_UNSAFE_AUTH_ENABLED=true`, `DEV_AUTH_ENABLED=true` and
@@ -126,5 +150,5 @@ its `collab-hub-<version>` tag.
 ## Reporting security issues
 
 Do not open a public issue for vulnerabilities. Use GitHub's
-[Report a vulnerability](https://github.com/nebari-dev/collab-hub-pack/security/advisories/new)
+[Report a vulnerability](https://github.com/openteams-ai/collab-hub-pack/security/advisories/new)
 to open a private advisory with the maintainers.
