@@ -30,6 +30,7 @@ on:
       - "scripts/keycloak_login_browser.py"
       - "helm/**"
       - ".github/workflows/dev-env.yaml"
+      - "scripts/ci/**"
   pull_request: {}   # runs on every PR so it can be a required status check
 
 concurrency:
@@ -460,23 +461,9 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install Helm
-        # Pinned: when the latest-release lookup in azure/setup-helm failed it
-        # fell back to Helm 3, whose schema errors the negative render tests do
-        # not expect. The version AND its sha256 live here, rather than a
-        # checksum fetched alongside the tarball from the same server, so a
-        # changed download is a CI failure and not a changed CI (#205).
-        # On upgrade, take the sha256 for linux-amd64 from the release notes
-        # at https://github.com/helm/helm/releases and update both lines.
-        run: |
-          set -euo pipefail
-          version=v4.3.0
-          sha256=86584a54def73570558f66f5111cc53dfed56689637ae32c1201205d494f54fb
-          curl -sSLo helm.tar.gz "https://get.helm.sh/helm-${version}-linux-amd64.tar.gz"
-          echo "${sha256}  helm.tar.gz" | sha256sum -c -
-          tar -xzf helm.tar.gz linux-amd64/helm
-          sudo mv linux-amd64/helm /usr/local/bin/helm
-          rm -rf helm.tar.gz linux-amd64
-          helm version --short
+        # Pinned version and sha256, in the one script every workflow shares;
+        # the why, and where the hash comes from on upgrade, are in there (#205).
+        run: scripts/ci/install_helm.sh
 
       - name: The chart renders with the dev values
         run: |
