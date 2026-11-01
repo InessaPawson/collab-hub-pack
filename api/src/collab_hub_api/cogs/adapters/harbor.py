@@ -348,8 +348,8 @@ def _permission_for(path: str) -> str | None:
     """The Harbor permission a listing route needs, for a 403 message.
 
     ``/projects/{p}/repositories`` needs ``repository:list``; the artifacts
-    route under it needs ``artifact:list`` (and ``tag:list`` for the
-    ``with_tag`` expansion). ``None`` for any other path.
+    route under it needs ``artifact:list``.
+    ``None`` for any other path.
     """
 
     if path.endswith("/artifacts"):
