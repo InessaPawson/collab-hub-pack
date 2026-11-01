@@ -64,8 +64,14 @@ publisher writes into ``COG.md`` or the profile lands in the catalog as-is.
 The guarantee this module makes is narrower and absolute: *configured
 registry credentials* never reach cards, ``read_errors``, or logs.
 ``read_errors`` and log lines therefore carry exception class names -- plus
-the message only for the OCI hierarchy, whose contract is that messages name
-neither URLs nor headers -- never raw URLs, tokens, or exception chains.
+the message only where its contract keeps it safe: the OCI hierarchy, whose
+messages name neither URLs nor headers, and
+:class:`~collab_hub_api.cogs.registry.RegistrySourceAuthError`, whose
+message the Harbor adapter builds from the source id, the API path, the
+status and the permission that path needs -- never the host, the credential
+or the response body. That message is the one thing that tells an operator
+which permission a robot account lacks, so it is kept. Everything else is
+class name alone: never raw URLs, tokens, or exception chains.
 
 Fairness under bounds: enumeration is complete (or the source is marked
 failed), while *fetching* is budgeted per sweep. Already-known digests cost
