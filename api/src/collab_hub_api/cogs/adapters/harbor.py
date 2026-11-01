@@ -250,6 +250,7 @@ class HarborRegistrySource:
                 missing = _permission_for(path)
                 if missing:
                     message += f"; the credential is probably missing the project-scoped {missing} permission"
+                    message += f", or is not scoped to the project at {path}"
             raise RegistrySourceAuthError(message)
         if status == 404:
             raise RegistrySourceError(f"source {self.id!r}: {path} does not exist on the registry (HTTP 404)")
