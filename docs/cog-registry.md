@@ -111,10 +111,10 @@ cog_index_source_failed source=harbor-dev reason="list_repositories: RegistrySou
 
 | Kind | Grant the credential | Why |
 | --- | --- | --- |
-| `harbor` | Project-scoped `repository:list`, `repository:pull`, `artifact:read`, `artifact:list`, `tag:list` on each project in `projects` | `repository:list` enumerates the project's repositories, `artifact:list` and `tag:list` enumerate what is in each one, and `artifact:read` with `repository:pull` fetch the manifests and the `COG.md` blobs. |
+| `harbor` | Project-scoped `repository:list`, `repository:pull`, `artifact:list` on each project in `projects` | `repository:list` enumerates the project's repositories, `artifact:list` enumerate what is in each one, and `repository:pull` fetch the manifests and the `COG.md` blobs. |
 | `static` | Pull on each repository in `repositories` (and in the index document, if `indexUrl` is set) | A static source enumerates through the OCI distribution API alone, so tag listing, manifest reads and blob reads are all covered by the registry's pull right. |
 
-The indexer only reads, none of these needs push, delete, or project
+The indexer only reads; none of these needs push, delete, or project
 admin. A project-scoped robot account in Harbor (*Project → Robot Accounts*)
 with exactly the five permissions above is enough. A system-scoped robot works
 too but grants more than the indexer uses.

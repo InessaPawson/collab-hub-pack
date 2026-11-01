@@ -353,7 +353,7 @@ def _permission_for(path: str) -> str | None:
     """
 
     if path.endswith("/artifacts"):
-        return "artifact:list (and tag:list)"
+        return "artifact:list"
     if path.endswith("/repositories"):
         return "repository:list"
     return None
