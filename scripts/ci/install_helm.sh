@@ -19,6 +19,8 @@ version=v4.3.1
 sha256=0403a88ae20913d11b10a2467b50087721fea7581736da6b9d3992f5357fe54b
 
 dest="${1:-/usr/local/bin}"
+# install does not create the directory; make it first, with sudo if the parent needs it.
+mkdir -p "$dest" 2>/dev/null || sudo mkdir -p "$dest"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
