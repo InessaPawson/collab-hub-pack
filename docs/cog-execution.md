@@ -14,21 +14,24 @@ redirections.
 ## What you need
 
 - Python 3.11 or later, and `pip` (or [uv](https://docs.astral.sh/uv/)).
-- A hub with Cog runs turned on: the API's `cog_runs`
-  [feature flag](feature-flags.md), and a run controller beside it
+- A hub whose run API has Cogs to launch, and a run controller beside it
   ([`cog-execution/runs.md`](cog-execution/runs.md#the-run-controller-and-the-run-api)).
-  Without the flag, `/v1/runs` answers 404; without a controller, a launched
-  run stays `SUBMITTED`.
+  Every hub serves the run API, `/v1/runs`, on its own database. What it can
+  launch are the Cog packages its controller is given, which `cog list
+  --launchable` names; without a controller, a launched run stays `SUBMITTED`.
 
-  **The published API image cannot serve these yet.** The image
-  (`ghcr.io/nebari-dev/collab-hub-pack/api`) does not ship the execution
-  package the run API imports, so with `cog_runs` on it fails at startup, and
-  the Helm chart runs no controller ([`feature-flags.md`](feature-flags.md)).
-  These steps work against a hub run from a checkout of this repository:
+  **On a hub deployed with the Helm chart**, the run controller is off unless
+  `runs.controller.enabled` is set. With it on, the controller runs in the
+  API's pod and runs each Cog as a process of that pod: the Cogs the image
+  ships, `hello` and `hermes`, which `cog list --launchable` names
+  ([`standalone-deployment.md`](standalone-deployment.md#running-cogs-beside-the-api)).
+  Such a worker is not isolated from the hub, which suits a development hub;
+  Cogs that run as pods of their own come in a later phase of
+  [`COG_EXECUTION.md`](../COG_EXECUTION.md). The Cogs `cog list` shows are the
+  hub's catalog, which is not launchable by name until a Cog is installed by
+  its digest. A hub run from a checkout of this repository works the same way:
   [`dev/`](../dev/README.md#running-cogs-and-ops), or
-  [`examples/cog-local`](../examples/cog-local/README.md). The image and the
-  chart gain both in later phases of
-  [`COG_EXECUTION.md`](../COG_EXECUTION.md).
+  [`examples/cog-local`](../examples/cog-local/README.md).
 - An account in the hub's realm.
 - To chat with a Cog from a terminal interface:
   [Toad](https://github.com/batrachianai/toad), an ACP client
@@ -38,7 +41,7 @@ redirections.
 ## 1. Install the CLI from `main`
 
 ```sh
-pip install "git+https://github.com/nebari-dev/collab-hub-pack.git@main#subdirectory=cli"
+pip install "git+https://github.com/openteams-ai/collab-hub-pack.git@main#subdirectory=cli"
 collab-hub --help
 ```
 
@@ -47,8 +50,8 @@ command is `collab-hub`. Install it in a virtual environment, or as a tool of
 its own:
 
 ```sh
-uv tool install "git+https://github.com/nebari-dev/collab-hub-pack.git@main#subdirectory=cli"
-pipx install "git+https://github.com/nebari-dev/collab-hub-pack.git@main#subdirectory=cli"
+uv tool install "git+https://github.com/openteams-ai/collab-hub-pack.git@main#subdirectory=cli"
+pipx install "git+https://github.com/openteams-ai/collab-hub-pack.git@main#subdirectory=cli"
 ```
 
 To pick up later changes on `main`, install again with `--force-reinstall`
@@ -60,7 +63,7 @@ To install from a checkout instead, for a branch other than `main` or to
 change the CLI:
 
 ```sh
-git clone https://github.com/nebari-dev/collab-hub-pack.git
+git clone https://github.com/openteams-ai/collab-hub-pack.git
 cd collab-hub-pack
 pip install -e cli
 collab-hub --help
