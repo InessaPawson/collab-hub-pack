@@ -131,7 +131,7 @@ call with a bare `403 forbidden`, before any artifact is read:
 
 ```
 GET /api/v2.0/projects/cogs/repositories -> 403
-cog_index_source_failed source=harbor-dev reason="list_repositories: RegistrySourceAuthError"
+cog_index_source_failed source=harbor-dev reason="list_repositories: RegistrySourceAuthError: source 'harbor-dev': the registry API refused the configured credential for /projects/cogs/repositories (HTTP 403); the credential is probably missing the project-scoped repository:list permission, or is not scoped to the project at /projects/cogs/repositories"
 ```
 
 | Kind | Grant the credential | Why |
@@ -141,7 +141,7 @@ cog_index_source_failed source=harbor-dev reason="list_repositories: RegistrySou
 
 The indexer only reads; none of these needs push, delete, or project
 admin. A project-scoped robot account in Harbor (*Project → Robot Accounts*)
-with exactly the five permissions above is enough. A system-scoped robot works
+with exactly the 3 permissions above is enough. A system-scoped robot works
 too but grants more than the indexer uses.
 
 ## CA bundle
